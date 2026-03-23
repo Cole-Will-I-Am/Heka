@@ -10,9 +10,12 @@ Every code change goes through:
 """
 
 import ast
+import asyncio
 import json
 import logging
+import os
 import shutil
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -103,7 +106,7 @@ Rules:
 - NEVER create files with placeholder content
 - Every file must have real, functional code"""
 
-        plan_data = await self.architect.generate_json(prompt)
+        plan_data = await self.architect.generate_json(prompt, num_predict=1200)
 
         if not plan_data or plan_data.get("confidence", 0) < 0.3:
             log.info("Architect confidence too low — skipping evolution")
@@ -126,23 +129,31 @@ Rules:
 
     async def implement(self, plan: EvolutionPlan) -> Optional[dict[str, str]]:
         """Coder writes the actual code for a plan."""
-        implementations = {}
+        implementations: dict[str, Optional[str]] = {}
 
-        for file_spec in plan.files:
+        def _strip_fences(text: str) -> str:
+            code = text.strip()
+            if code.startswith("```"):
+                lines = code.split("\n")
+                end = len(lines)
+                for i in range(len(lines) - 1, 0, -1):
+                    if lines[i].strip().startswith("```"):
+                        end = i
+                        break
+                code = "\n".join(lines[1:end])
+            return code
+
+        async def _implement_one(file_spec: dict) -> tuple[Optional[str], Optional[str]]:
             path = file_spec.get("path", "")
             intent = file_spec.get("intent", "")
-
             if not path or not intent:
-                continue
+                return None, None
 
             full_path = self.base_path / path
-            existing = ""
-            if full_path.exists():
-                existing = full_path.read_text(errors="replace")
+            existing = full_path.read_text(errors="replace") if full_path.exists() else ""
 
             if plan.action == "delete":
-                implementations[path] = None
-                continue
+                return path, None
 
             prompt = f"""Write Python code for: {intent}
 
@@ -160,53 +171,38 @@ Requirements:
 - Production quality — this will run autonomously
 - Output ONLY the complete file content, nothing else"""
 
-            thought = await self.coder.think(prompt)
-            code = thought.content.strip()
+            thought = await self.coder.think(prompt, num_predict=4096)
+            code = _strip_fences(thought.content)
 
-            # Strip markdown fences
-            if code.startswith("```"):
-                lines = code.split("\n")
-                end = len(lines)
-                for i in range(len(lines) - 1, 0, -1):
-                    if lines[i].strip().startswith("```"):
-                        end = i
-                        break
-                code = "\n".join(lines[1:end])
-
-            # Validate Python syntax
             if path.endswith(".py"):
                 try:
                     ast.parse(code)
                 except SyntaxError as e:
                     log.warning(f"Coder produced invalid Python for {path}: {e}")
-                    # One retry with the error
                     retry = await self.coder.think(
                         f"Your previous code had a syntax error: {e}\n\n"
-                        f"Fix it. Output ONLY the corrected complete file.",
+                        "Fix it. Output ONLY the corrected complete file.",
                         context=code,
+                        num_predict=4096,
                     )
-                    code = retry.content.strip()
-                    if code.startswith("```"):
-                        lines = code.split("\n")
-                        end = len(lines)
-                        for i in range(len(lines) - 1, 0, -1):
-                            if lines[i].strip().startswith("```"):
-                                end = i
-                                break
-                        code = "\n".join(lines[1:end])
+                    code = _strip_fences(retry.content)
                     try:
                         ast.parse(code)
                     except SyntaxError:
                         log.error(f"Retry also produced invalid Python for {path}")
-                        continue
+                        return None, None
 
-            # Reject degenerate output
             stripped_lines = [l for l in code.split("\n") if l.strip()]
             if len(stripped_lines) < 3:
                 log.warning(f"Degenerate output for {path}: only {len(stripped_lines)} lines")
-                continue
+                return None, None
 
-            implementations[path] = code
+            return path, code
+
+        tasks = [_implement_one(file_spec) for file_spec in plan.files]
+        for path, code in await asyncio.gather(*tasks):
+            if path:
+                implementations[path] = code
 
         return implementations if implementations else None
 
@@ -261,9 +257,8 @@ Requirements:
             # Post-write syntax check
             for path, content in implementations.items():
                 if content is not None and path.endswith(".py"):
-                    full_path = self.base_path / path
                     try:
-                        ast.parse(full_path.read_text())
+                        ast.parse(content)
                     except SyntaxError as e:
                         raise RuntimeError(
                             f"Post-write syntax error in {path}: {e}"
@@ -302,7 +297,8 @@ Requirements:
                 rollback_performed=True,
             )
 
-    async def update_readme(self, result: EvolutionResult, plan: EvolutionPlan):
+    async def update_readme(self, result: EvolutionResult, plan: EvolutionPlan,
+                            codebase_snapshot: Optional[dict] = None):
         """Have the Architect update README.md to reflect what changed."""
         readme_path = self.base_path / "README.md"
         if not readme_path.exists():
@@ -310,25 +306,35 @@ Requirements:
 
         current_readme = readme_path.read_text(errors="replace")
 
-        # Scan current project structure for accuracy
-        py_files = sorted(self.base_path.rglob("*.py"))
-        py_files = [
-            f for f in py_files
-            if not any(
-                p.startswith(".") or p == "__pycache__"
-                for p in f.relative_to(self.base_path).parts
-            )
-        ]
         file_list = []
-        for f in py_files:
-            try:
-                loc = len([
-                    l for l in f.read_text(errors="replace").split("\n")
-                    if l.strip() and not l.strip().startswith("#")
-                ])
-                file_list.append(f"{f.relative_to(self.base_path)} ({loc} lines)")
-            except Exception:
-                file_list.append(str(f.relative_to(self.base_path)))
+        if codebase_snapshot and isinstance(codebase_snapshot.get("files"), list):
+            for item in codebase_snapshot["files"]:
+                path = item.get("path")
+                if not path:
+                    continue
+                loc = item.get("loc")
+                if isinstance(loc, int):
+                    file_list.append(f"{path} ({loc} lines)")
+                else:
+                    file_list.append(str(path))
+        else:
+            py_files = sorted(self.base_path.rglob("*.py"))
+            py_files = [
+                f for f in py_files
+                if not any(
+                    p.startswith(".") or p == "__pycache__"
+                    for p in f.relative_to(self.base_path).parts
+                )
+            ]
+            for f in py_files:
+                try:
+                    loc = len([
+                        l for l in f.read_text(errors="replace").split("\n")
+                        if l.strip() and not l.strip().startswith("#")
+                    ])
+                    file_list.append(f"{f.relative_to(self.base_path)} ({loc} lines)")
+                except Exception:
+                    file_list.append(str(f.relative_to(self.base_path)))
 
         prompt = f"""The project just evolved. Update the README.md to reflect the current state.
 
@@ -352,7 +358,7 @@ Rules:
 - Do NOT add fluff — keep it tight
 - Output ONLY the complete updated README.md content"""
 
-        thought = await self.architect.think(prompt, temperature=0.3)
+        thought = await self.architect.think(prompt, temperature=0.3, num_predict=2400)
         new_readme = thought.content.strip()
 
         # Strip markdown fences if the model wrapped it
@@ -372,6 +378,75 @@ Rules:
 
         readme_path.write_text(new_readme)
         log.info("README.md updated by Architect")
+
+    async def git_record(self, cycle: int, plan: EvolutionPlan,
+                         result: EvolutionResult) -> dict:
+        if not result.success:
+            return {"committed": False, "pushed": False, "reason": "evolution_failed"}
+        return await asyncio.to_thread(self._git_record_sync, cycle, plan, result)
+
+    def _git_record_sync(self, cycle: int, plan: EvolutionPlan,
+                         result: EvolutionResult) -> dict:
+        repo = self.base_path
+        git_dir = repo / ".git"
+        if not git_dir.exists():
+            return {"committed": False, "pushed": False, "reason": "no_git_repo"}
+
+        def _run(args: list[str], timeout: int = 20) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["git", "-C", str(repo), *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+
+        files_to_stage = []
+        for path in result.files_affected:
+            full = repo / path
+            if full.exists() or path in result.files_affected:
+                files_to_stage.append(path)
+        if (repo / "README.md").exists():
+            files_to_stage.append("README.md")
+
+        if files_to_stage:
+            add = _run(["add", "--", *files_to_stage])
+            if add.returncode != 0:
+                return {
+                    "committed": False,
+                    "pushed": False,
+                    "reason": f"git_add_failed: {add.stderr.strip()[:200]}",
+                }
+
+        diff = _run(["diff", "--cached", "--quiet"])
+        if diff.returncode == 0:
+            return {"committed": False, "pushed": False, "reason": "no_staged_changes"}
+
+        short_reason = " ".join(plan.reasoning.split())[:72] or "autonomous update"
+        message = f"heka cycle {cycle}: {plan.action} - {short_reason}"
+        commit = _run(["commit", "-m", message], timeout=30)
+        if commit.returncode != 0:
+            return {
+                "committed": False,
+                "pushed": False,
+                "reason": f"git_commit_failed: {commit.stderr.strip()[:200]}",
+            }
+
+        pushed = False
+        push_reason = "push_disabled"
+        if os.environ.get("HEKA_GIT_PUSH", "1").lower() not in {"0", "false", "no"}:
+            branch = _run(["rev-parse", "--abbrev-ref", "HEAD"])
+            if branch.returncode == 0:
+                branch_name = branch.stdout.strip() or "main"
+                push = _run(["push", "origin", branch_name], timeout=45)
+                if push.returncode == 0:
+                    pushed = True
+                    push_reason = "ok"
+                else:
+                    push_reason = f"git_push_failed: {push.stderr.strip()[:200]}"
+            else:
+                push_reason = "branch_unknown"
+
+        return {"committed": True, "pushed": pushed, "reason": push_reason}
 
     def _rollback(self, backups: dict[str, Path]):
         for path, backup_path in backups.items():

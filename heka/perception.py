@@ -8,11 +8,11 @@ system health, and the external environment.
 import ast
 import os
 import logging
-import subprocess
 import sys
 import time
 from pathlib import Path
 
+import httpx
 import psutil
 
 log = logging.getLogger("heka.perception")
@@ -25,12 +25,13 @@ class Perception:
         self.base_path = Path(base_path)
 
     def perceive(self) -> dict:
+        scan = self._scan_codebase()
         return {
             "timestamp": time.time(),
-            "codebase": self._scan_codebase(),
+            "codebase": scan["codebase"],
             "health": self._check_health(),
             "environment": self._check_environment(),
-            "self": self._read_self_summary(),
+            "self": scan["self"],
         }
 
     def _scan_codebase(self) -> dict:
@@ -46,15 +47,21 @@ class Perception:
         total_loc = 0
         files_info = []
         issues = []
+        own_files = []
+        own_loc = 0
 
         for f in py_files:
             try:
+                rel_path = str(f.relative_to(self.base_path))
                 content = f.read_text(errors="replace")
                 lines = content.split("\n")
                 loc = len([
                     l for l in lines if l.strip() and not l.strip().startswith("#")
                 ])
                 total_loc += loc
+                if rel_path.startswith("heka/"):
+                    own_files.append(rel_path)
+                    own_loc += loc
 
                 try:
                     tree = ast.parse(content)
@@ -67,7 +74,7 @@ class Perception:
                         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
                     )
                     files_info.append({
-                        "path": str(f.relative_to(self.base_path)),
+                        "path": rel_path,
                         "loc": loc,
                         "classes": classes,
                         "functions": functions,
@@ -78,7 +85,7 @@ class Perception:
                         f"Syntax error in {f.relative_to(self.base_path)}: {e}"
                     )
                     files_info.append({
-                        "path": str(f.relative_to(self.base_path)),
+                        "path": rel_path,
                         "loc": loc,
                         "valid": False,
                         "error": str(e),
@@ -87,10 +94,13 @@ class Perception:
                 issues.append(f"Cannot read {f}: {e}")
 
         return {
-            "file_count": len(py_files),
-            "total_loc": total_loc,
-            "files": files_info,
-            "issues": issues,
+            "codebase": {
+                "file_count": len(py_files),
+                "total_loc": total_loc,
+                "files": files_info,
+                "issues": issues,
+            },
+            "self": {"source_files": own_files, "total_own_loc": own_loc},
         }
 
     def _check_health(self) -> dict:
@@ -129,14 +139,9 @@ class Perception:
 
         # Check Ollama
         try:
-            result = subprocess.run(
-                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                 "http://localhost:11434/"],
-                capture_output=True, text=True, timeout=5,
-            )
-            env["ollama_status"] = (
-                "running" if result.stdout.strip() == "200" else "unreachable"
-            )
+            with httpx.Client(timeout=2.0) as client:
+                response = client.get("http://localhost:11434/")
+            env["ollama_status"] = "running" if response.status_code == 200 else "unreachable"
         except Exception:
             env["ollama_status"] = "unreachable"
 
@@ -153,27 +158,6 @@ class Perception:
             env["git_head"] = "git unavailable"
 
         return env
-
-    def _read_self_summary(self) -> dict:
-        heka_dir = self.base_path / "heka"
-        own_files = []
-        total_loc = 0
-
-        if heka_dir.exists():
-            for f in heka_dir.rglob("*.py"):
-                rel = str(f.relative_to(self.base_path))
-                try:
-                    content = f.read_text(errors="replace")
-                    loc = len([
-                        l for l in content.split("\n")
-                        if l.strip() and not l.strip().startswith("#")
-                    ])
-                    own_files.append(rel)
-                    total_loc += loc
-                except Exception:
-                    own_files.append(f"{rel} [unreadable]")
-
-        return {"source_files": own_files, "total_own_loc": total_loc}
 
     def read_own_source(self) -> dict[str, str]:
         """Return full source code of all Heka modules."""

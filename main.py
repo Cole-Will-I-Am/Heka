@@ -51,6 +51,7 @@ async def run():
 
     # Resurrection check
     prev = watchdog.check_previous_instance()
+    prev_state = None
     if prev and prev["status"] == "crashed":
         log.warning(
             f"Previous instance crashed at cycle {prev.get('last_cycle', '?')}. "
@@ -88,6 +89,11 @@ async def run():
     consciousness = Consciousness(soul, analyst, memory)
     evolution = Evolution(BASE_PATH, architect, coder, council, memory)
 
+    if prev_state:
+        cstate = prev_state.get("consciousness")
+        if cstate:
+            consciousness.restore(cstate)
+
     journal.record(
         cycle=0,
         event="awakening",
@@ -118,19 +124,59 @@ async def run():
         log.info(f"{'=' * 60}")
 
         try:
+            phase_times: dict[str, float] = {}
+
             # 1. PERCEIVE
             log.info("[1/6] Perceiving...")
+            t_phase = time.time()
             state = perception.perceive()
-            watchdog.heartbeat(cycle, "perceiving")
+            phase_times["perceive"] = time.time() - t_phase
+            hazards = watchdog.runtime_hazards(state)
+            watchdog.heartbeat(cycle, "perceiving", meta={"hazards": hazards})
+
+            if hazards["alerts"]:
+                journal.record(
+                    cycle=cycle,
+                    event="runtime_hazards",
+                    category="error" if hazards["severity"] == "critical" else "decision",
+                    data=hazards,
+                    narrative=f"Hazard scan: {', '.join(hazards['alerts'])}",
+                )
+
+            if "ollama_down" in hazards["alerts"]:
+                log.error("Ollama is unreachable. Preserving state and retrying soon.")
+                await memory.store_episodic(
+                    event="ollama_down",
+                    data={"cycle": cycle, "hazards": hazards},
+                    significance=0.95,
+                    cycle=cycle,
+                )
+                soul.tick()
+                memory.flush()
+                watchdog.save_state({
+                    "cycle": cycle,
+                    "soul": soul.serialize(),
+                    "consciousness": consciousness.snapshot(),
+                    "memory_stats": memory.stats(),
+                    "journal_stats": journal.stats(),
+                    "hazards": hazards,
+                    "timing": phase_times,
+                })
+                await asyncio.sleep(30)
+                continue
 
             # 2. THINK
             log.info("[2/6] Thinking...")
+            t_phase = time.time()
             thoughts = await consciousness.perceive_and_think(state)
+            phase_times["think"] = time.time() - t_phase
 
             if cycle % INTROSPECTION_INTERVAL == 0:
                 log.info("  Deep introspection...")
+                t_intro = time.time()
                 own_source = perception.read_own_source()
                 await consciousness.introspect(own_source)
+                phase_times["introspect"] = time.time() - t_intro
 
             journal.record(
                 cycle=cycle,
@@ -145,11 +191,13 @@ async def run():
                     f"{thoughts[0].content[:100]}" if thoughts else "Quiet mind."
                 ),
             )
-            watchdog.heartbeat(cycle, "thinking")
+            watchdog.heartbeat(cycle, "thinking", meta={"thought_count": len(thoughts)})
 
             # 3. PLAN
             log.info("[3/6] Planning evolution...")
+            t_phase = time.time()
             plan = await evolution.plan(thoughts, state, cycle)
+            phase_times["plan"] = time.time() - t_phase
 
             if plan is None:
                 log.info("No evolution needed this cycle. Resting.")
@@ -176,23 +224,29 @@ async def run():
 
                 # 4. IMPLEMENT
                 log.info(f"[4/6] Implementing ({plan.action})...")
+                t_phase = time.time()
                 implementations = await evolution.implement(plan)
+                phase_times["implement"] = time.time() - t_phase
                 watchdog.heartbeat(cycle, "implementing")
 
                 if implementations:
                     # 5. REVIEW
                     log.info("[5/6] Council review...")
+                    t_phase = time.time()
                     approved, reason = await evolution.review(
                         plan, implementations
                     )
+                    phase_times["review"] = time.time() - t_phase
 
                     if approved:
                         log.info("  Council APPROVED")
                         # 6. EXECUTE
                         log.info("[6/6] Executing...")
+                        t_phase = time.time()
                         result = await evolution.execute(
                             plan, implementations, cycle
                         )
+                        phase_times["execute"] = time.time() - t_phase
 
                         journal.record(
                             cycle=cycle,
@@ -217,7 +271,25 @@ async def run():
                         # Update README if evolution succeeded
                         if result.success:
                             log.info("  Updating README...")
-                            await evolution.update_readme(result, plan)
+                            t_readme = time.time()
+                            await evolution.update_readme(
+                                result, plan, codebase_snapshot=state.get("codebase")
+                            )
+                            phase_times["readme"] = time.time() - t_readme
+
+                            git_info = await evolution.git_record(cycle, plan, result)
+                            journal.record(
+                                cycle=cycle,
+                                event="git_record",
+                                category="decision",
+                                data=git_info,
+                                narrative=(
+                                    "Version control update: "
+                                    f"commit={git_info.get('committed')} "
+                                    f"push={git_info.get('pushed')} "
+                                    f"reason={git_info.get('reason')}"
+                                ),
+                            )
 
                         await consciousness.reflect({
                             "success": result.success,
@@ -248,16 +320,32 @@ async def run():
 
             # Soul tick
             soul.tick()
+            memory.flush()
+
+            elapsed = time.time() - cycle_start
+            phase_times["total"] = elapsed
 
             # Save state for resurrection
             watchdog.save_state({
                 "cycle": cycle,
                 "soul": soul.serialize(),
+                "consciousness": consciousness.snapshot(),
                 "memory_stats": memory.stats(),
                 "journal_stats": journal.stats(),
+                "hazards": hazards,
+                "timing": phase_times,
             })
 
-            elapsed = time.time() - cycle_start
+            journal.record(
+                cycle=cycle,
+                event="cycle_timing",
+                category="decision",
+                data={"timing": phase_times},
+                narrative=(
+                    "Cycle timings (s): "
+                    + ", ".join(f"{k}={v:.2f}" for k, v in sorted(phase_times.items()))
+                ),
+            )
             log.info(
                 f"Cycle {cycle} complete in {elapsed:.1f}s. "
                 f"Next in {CYCLE_INTERVAL}s."
@@ -289,9 +377,11 @@ async def run():
     watchdog.save_state({
         "cycle": soul.cycle_count,
         "soul": soul.serialize(),
+        "consciousness": consciousness.snapshot(),
         "shutdown": "graceful",
     })
 
+    memory.flush()
     await architect.close()
     await coder.close()
     await analyst.close()

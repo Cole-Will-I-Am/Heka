@@ -52,13 +52,15 @@ class Watchdog:
     def should_continue(self) -> bool:
         return not self._shutdown_requested
 
-    def heartbeat(self, cycle: int, status: str = "alive"):
+    def heartbeat(self, cycle: int, status: str = "alive", meta: Optional[dict] = None):
         data = {
             "pid": os.getpid(),
             "cycle": cycle,
             "status": status,
             "timestamp": time.time(),
         }
+        if meta:
+            data["meta"] = meta
         self.heartbeat_path.write_text(json.dumps(data))
 
         # Notify systemd watchdog if configured
@@ -111,6 +113,46 @@ class Watchdog:
 
     def write_pid(self):
         self.pid_path.write_text(str(os.getpid()))
+
+    def runtime_hazards(self, perception: dict) -> dict:
+        health = perception.get("health", {}) if isinstance(perception, dict) else {}
+        env = perception.get("environment", {}) if isinstance(perception, dict) else {}
+        alerts = []
+        severity = "normal"
+
+        disk_percent = float(health.get("disk_percent", 0) or 0)
+        disk_free_gb = float(health.get("disk_free_gb", 0) or 0)
+        mem_percent = float(health.get("memory_percent", 0) or 0)
+        mem_avail_mb = float(health.get("memory_available_mb", 0) or 0)
+
+        if disk_percent >= 98 or disk_free_gb < 1.0:
+            alerts.append("disk_critical")
+            severity = "critical"
+        elif disk_percent >= 90 or disk_free_gb < 3.0:
+            alerts.append("disk_low")
+            severity = "degraded" if severity != "critical" else severity
+
+        if mem_percent >= 95 or mem_avail_mb < 256:
+            alerts.append("memory_critical")
+            severity = "critical"
+        elif mem_percent >= 85 or mem_avail_mb < 768:
+            alerts.append("memory_pressure")
+            severity = "degraded" if severity != "critical" else severity
+
+        if env.get("ollama_status") != "running":
+            alerts.append("ollama_down")
+            severity = "critical"
+
+        try:
+            soft_limit = os.sysconf("SC_OPEN_MAX")
+            if soft_limit and soft_limit < 256:
+                alerts.append("fd_limit_low")
+                if severity == "normal":
+                    severity = "degraded"
+        except Exception:
+            pass
+
+        return {"severity": severity, "alerts": alerts}
 
     def cleanup(self):
         if self.pid_path.exists():

@@ -51,6 +51,28 @@ class Council:
         self.analyst = analyst
         self.history: list[Deliberation] = []
 
+    @staticmethod
+    def _normalize_position(value: str) -> str:
+        if not value:
+            return "abstain"
+        v = value.strip().lower()
+        if v in {"approve", "approved", "yes"}:
+            return "approve"
+        if v in {"reject", "rejected", "no"}:
+            return "reject"
+        return "abstain"
+
+    @staticmethod
+    def _needs_debate(votes: list[Vote]) -> bool:
+        cast = [v for v in votes if v.position in {"approve", "reject"} and v.confidence > 0]
+        if not cast:
+            return True
+        positions = {v.position for v in cast}
+        if len(positions) > 1:
+            return True
+        avg_conf = sum(v.confidence for v in cast) / len(cast)
+        return avg_conf < 0.62
+
     async def deliberate(self, topic: str, context: str,
                          max_rounds: int = 2) -> Deliberation:
         delib = Deliberation(topic=topic, context=context)
@@ -59,69 +81,99 @@ class Council:
 
         initial_prompt = (
             f"Topic for deliberation: {topic}\n\n"
-            f"Provide your analysis and recommendation. Be specific and concise."
+            "Provide your recommendation in strict JSON.\n"
+            "Use short text only.\n"
+            "Respond with JSON:\n"
+            '{"position":"approve|reject|abstain","confidence":0.0-1.0,'
+            '"reasoning":"max 30 words"}'
         )
 
-        # Round 1: Initial thoughts (parallel)
+        # Round 1: Initial thoughts + provisional vote (parallel)
         import asyncio as _aio
-        initial_thoughts = await _aio.gather(
-            self.architect.think(initial_prompt, context=context),
-            self.coder.think(initial_prompt, context=context),
-            self.analyst.think(initial_prompt, context=context),
+        initial_votes = await _aio.gather(
+            self.architect.generate_json(initial_prompt, context=context, num_predict=420),
+            self.coder.generate_json(initial_prompt, context=context, num_predict=320),
+            self.analyst.generate_json(initial_prompt, context=context, num_predict=320),
         )
-        delib.thoughts.extend(initial_thoughts)
-        for t in initial_thoughts:
-            log.info(f"  {t.mind}: {t.content[:120]}...")
+        for mind, vote_data in zip(
+            [self.architect, self.coder, self.analyst], initial_votes
+        ):
+            if isinstance(vote_data, dict):
+                analysis = str(vote_data.get("reasoning", "")).strip()
+                position = self._normalize_position(str(vote_data.get("position", "abstain")))
+                confidence = float(vote_data.get("confidence", 0.5))
+            else:
+                analysis = "Failed to provide structured analysis."
+                position = "abstain"
+                confidence = 0.0
+
+            if not analysis:
+                analysis = "No analysis provided."
+
+            thought = Thought(mind=mind.name, content=analysis, confidence=confidence)
+            delib.thoughts.append(thought)
+            delib.votes.append(Vote(
+                mind=mind.name,
+                position=position,
+                reasoning=analysis,
+                confidence=confidence,
+            ))
+            log.info(f"  {thought.mind}: {thought.content[:120]}...")
 
         delib.rounds = 1
 
         # Round 2: Debate — each mind responds to others (parallel)
-        if max_rounds > 1:
+        if max_rounds > 1 and self._needs_debate(delib.votes):
             others_summary = "\n\n".join(
                 f"{t.mind.upper()}: {t.content}" for t in delib.thoughts
             )
             debate_prompt = (
                 f"The other minds have weighed in:\n\n{others_summary}\n\n"
-                f"Do you agree or disagree? Challenge weak points. Be direct."
+                "Do you agree or disagree? Challenge weak points and sharpen the decision.\n"
+                "Keep your response under 180 words."
             )
 
             debate_thoughts = await _aio.gather(
-                self.architect.think(debate_prompt, context=context),
-                self.coder.think(debate_prompt, context=context),
-                self.analyst.think(debate_prompt, context=context),
+                self.architect.think(debate_prompt, context=context, num_predict=800),
+                self.coder.think(debate_prompt, context=context, num_predict=800),
+                self.analyst.think(debate_prompt, context=context, num_predict=800),
             )
             delib.thoughts.extend(debate_thoughts)
 
             delib.rounds = 2
 
-        # Vote (parallel)
-        vote_prompt = (
-            f"Based on the deliberation about '{topic}', cast your vote.\n\n"
-            f'Respond with JSON: {{"position": "approve|reject|abstain", '
-            f'"reasoning": "your reasoning", "confidence": 0.0-1.0}}'
-        )
+            # Final vote after debate (parallel)
+            vote_prompt = (
+                f"Based on the full deliberation about '{topic}', cast your final vote.\n"
+                'Respond with JSON: {"position":"approve|reject|abstain",'
+                '"reasoning":"max 25 words","confidence":0.0-1.0}'
+            )
 
-        vote_results = await _aio.gather(
-            self.architect.generate_json(vote_prompt, context=context),
-            self.coder.generate_json(vote_prompt, context=context),
-            self.analyst.generate_json(vote_prompt, context=context),
-        )
-        for mind, vote_data in zip(
-            [self.architect, self.coder, self.analyst], vote_results
-        ):
-            if vote_data:
-                delib.votes.append(Vote(
-                    mind=mind.name,
-                    position=vote_data.get("position", "abstain"),
-                    reasoning=vote_data.get("reasoning", ""),
-                    confidence=float(vote_data.get("confidence", 0.5)),
-                ))
-            else:
-                delib.votes.append(Vote(
-                    mind=mind.name, position="abstain",
-                    reasoning="Failed to generate structured vote",
-                    confidence=0.0,
-                ))
+            vote_results = await _aio.gather(
+                self.architect.generate_json(vote_prompt, context=context, num_predict=320),
+                self.coder.generate_json(vote_prompt, context=context, num_predict=260),
+                self.analyst.generate_json(vote_prompt, context=context, num_predict=260),
+            )
+
+            delib.votes = []
+            for mind, vote_data in zip(
+                [self.architect, self.coder, self.analyst], vote_results
+            ):
+                if isinstance(vote_data, dict):
+                    delib.votes.append(Vote(
+                        mind=mind.name,
+                        position=self._normalize_position(vote_data.get("position", "abstain")),
+                        reasoning=vote_data.get("reasoning", ""),
+                        confidence=float(vote_data.get("confidence", 0.5)),
+                    ))
+                else:
+                    delib.votes.append(Vote(
+                        mind=mind.name, position="abstain",
+                        reasoning="Failed to generate structured vote",
+                        confidence=0.0,
+                    ))
+        else:
+            log.info("Skipping debate round: strong first-round agreement.")
 
         # Determine outcome
         approvals = sum(1 for v in delib.votes if v.position == "approve")
@@ -137,7 +189,10 @@ class Council:
             architect_vote = next(
                 (v for v in delib.votes if v.mind == "architect"), None
             )
-            delib.outcome = architect_vote.position if architect_vote else "rejected"
+            delib.outcome = (
+                "approved" if architect_vote and architect_vote.position == "approve"
+                else "rejected"
+            )
             delib.consensus = False
             log.info("Tie broken by Architect")
 
@@ -154,18 +209,90 @@ class Council:
 
     async def code_review(self, code: str, intent: str) -> tuple[bool, str]:
         """Analyst reviews, Architect approves/rejects."""
-        review = await self.analyst.think(
-            f"Review this code. Intent: {intent}\n\n"
-            f"Look for bugs, security issues, design problems. Be thorough but concise.",
-            context=code,
+        import asyncio as _aio
+        analyst_review, coder_review = await _aio.gather(
+            self.analyst.generate_json(
+                f"Review code for intent: {intent}\n"
+                "Return strict JSON:\n"
+                '{"position":"approve|reject|abstain","summary":"max 60 words",'
+                '"critical_issues":["..."],"confidence":0.0-1.0}',
+                context=code,
+                num_predict=420,
+            ),
+            self.coder.generate_json(
+                f"Review implementation realism for intent: {intent}\n"
+                "Return strict JSON:\n"
+                '{"position":"approve|reject|abstain","summary":"max 60 words",'
+                '"implementation_risks":["..."],"confidence":0.0-1.0}',
+                context=code,
+                num_predict=360,
+            ),
+        )
+
+        analyst_text = (
+            f"position={analyst_review.get('position', 'abstain')}, "
+            f"confidence={analyst_review.get('confidence', 0.0)}, "
+            f"summary={analyst_review.get('summary', '')}, "
+            f"critical_issues={analyst_review.get('critical_issues', [])}"
+            if isinstance(analyst_review, dict)
+            else "position=abstain, confidence=0.0, summary=review failed, critical_issues=[]"
+        )
+        coder_text = (
+            f"position={coder_review.get('position', 'abstain')}, "
+            f"confidence={coder_review.get('confidence', 0.0)}, "
+            f"summary={coder_review.get('summary', '')}, "
+            f"implementation_risks={coder_review.get('implementation_risks', [])}"
+            if isinstance(coder_review, dict)
+            else "position=abstain, confidence=0.0, summary=review failed, implementation_risks=[]"
         )
 
         decision = await self.architect.generate_json(
-            f"The Analyst reviewed code with intent '{intent}':\n\n"
-            f"Review: {review.content}\n\n"
-            f'Should we proceed? {{"approved": true/false, "reason": "..."}}',
+            f"The Analyst and Coder reviewed code with intent '{intent}'.\n\n"
+            f"Analyst: {analyst_text}\n"
+            f"Coder: {coder_text}\n\n"
+            "Return strict JSON only with concise values:\n"
+            '{"approved": true, "risk":"low|medium|high", "reason":"max 35 words"}\n'
+            "The 'approved' field must be a JSON boolean true or false.",
+            num_predict=220,
         )
 
-        if decision:
-            return decision.get("approved", False), decision.get("reason", "")
-        return False, "Failed to get Architect decision"
+        if isinstance(decision, dict):
+            approved_raw = decision.get("approved")
+            approved = None
+            if isinstance(approved_raw, bool):
+                approved = approved_raw
+            elif isinstance(approved_raw, str):
+                approved = approved_raw.strip().lower() in {"true", "approve", "approved", "yes", "1"}
+            elif isinstance(approved_raw, (int, float)):
+                approved = bool(approved_raw)
+
+            if approved is not None:
+                reason = decision.get("reason", "")
+                risk = decision.get("risk")
+                if risk:
+                    reason = f"[risk={risk}] {reason}"
+                return approved, reason or "Architect decision without reason"
+
+        fallback = await self.architect.think(
+            "Given these reviews, answer exactly in one line: APPROVE or REJECT, then a short reason.",
+            context=f"Analyst: {analyst_text}\n\nCoder: {coder_text}",
+            num_predict=80,
+        )
+        text = fallback.content.strip()
+        if not text:
+            analyst_pos = self._normalize_position(
+                str(analyst_review.get("position", "abstain"))
+                if isinstance(analyst_review, dict) else "abstain"
+            )
+            coder_pos = self._normalize_position(
+                str(coder_review.get("position", "abstain"))
+                if isinstance(coder_review, dict) else "abstain"
+            )
+            approvals = sum(1 for p in [analyst_pos, coder_pos] if p == "approve")
+            rejections = sum(1 for p in [analyst_pos, coder_pos] if p == "reject")
+            if approvals > rejections:
+                return True, "Architect response empty; accepted Analyst+Coder consensus."
+            return False, "Architect response empty; defaulting to conservative rejection."
+        approved = text.upper().startswith("APPROVE")
+        reason = text.split("\n", 1)[0][:220]
+        return approved, reason or "Failed to get Architect decision"

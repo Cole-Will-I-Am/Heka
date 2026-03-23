@@ -27,6 +27,9 @@ class Memory:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
+        self._pending_writes = 0
+        self._last_commit = time.time()
+        self._commit_every = 8
         self._init_db()
 
     def _init_db(self):
@@ -34,6 +37,7 @@ class Memory:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA temp_store=MEMORY")
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS episodic (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,6 +71,15 @@ class Memory:
         """)
         self._conn.commit()
 
+    def _maybe_commit(self, force: bool = False):
+        if not self._conn:
+            return
+        now = time.time()
+        if force or self._pending_writes >= self._commit_every or (now - self._last_commit) >= 2.0:
+            self._conn.commit()
+            self._pending_writes = 0
+            self._last_commit = now
+
     async def store_episodic(self, event: str, data: dict,
                              significance: float = 0.5, cycle: int = 0):
         self._conn.execute(
@@ -74,7 +87,8 @@ class Memory:
             "VALUES (?, ?, ?, ?, ?)",
             (event, json.dumps(data, default=str), significance, time.time(), cycle),
         )
-        self._conn.commit()
+        self._pending_writes += 1
+        self._maybe_commit()
 
     async def recall_episodic(self, event_pattern: str = "%",
                               limit: int = 20) -> list[dict]:
@@ -97,7 +111,8 @@ class Memory:
             "VALUES (?, ?, ?, ?, ?)",
             (key, value, json.dumps(tags or []), confidence, time.time()),
         )
-        self._conn.commit()
+        self._pending_writes += 1
+        self._maybe_commit()
 
     async def recall_semantic(self, key: str) -> Optional[dict]:
         row = self._conn.execute(
@@ -141,7 +156,8 @@ class Memory:
             "VALUES (?, ?, ?, ?, ?)",
             (strategy, context, outcome, int(success), time.time()),
         )
-        self._conn.commit()
+        self._pending_writes += 1
+        self._maybe_commit()
 
     async def recall_strategies(self, context_pattern: str = "%",
                                 only_successful: bool = False) -> list[dict]:
@@ -160,18 +176,37 @@ class Memory:
     async def get_context_for_decision(self, topic: str) -> str:
         parts = []
 
-        events = await self.recall_episodic(limit=10)
+        events = self._conn.execute(
+            "SELECT * FROM episodic ORDER BY timestamp DESC LIMIT 15"
+        ).fetchall()
         if events:
             parts.append("RECENT EVENTS:")
-            for e in events[:5]:
-                parts.append(f"  - {e['event']}: "
-                             f"{json.dumps(e['data'], default=str)[:200]}")
+            for e in events[:6]:
+                data = json.loads(e["data"])
+                parts.append(
+                    f"  - {e['event']} (cycle {e['cycle']}): "
+                    f"{json.dumps(data, default=str)[:220]}"
+                )
+
+        related_events = self._conn.execute(
+            "SELECT * FROM episodic WHERE event LIKE ? ORDER BY timestamp DESC LIMIT 8",
+            (f"%{topic}%",),
+        ).fetchall()
+        if related_events:
+            parts.append("\nRELATED EVENTS:")
+            for e in related_events[:5]:
+                data = json.loads(e["data"])
+                parts.append(
+                    f"  - {e['event']}: {json.dumps(data, default=str)[:220]}"
+                )
 
         knowledge = await self.search_semantic(query=topic)
         if knowledge:
             parts.append("\nRELEVANT KNOWLEDGE:")
             for k in knowledge[:5]:
-                parts.append(f"  - {k['key']}: {k['value'][:200]}")
+                parts.append(
+                    f"  - {k['key']} (conf {k['confidence']:.0%}): {k['value'][:220]}"
+                )
 
         strategies = await self.recall_strategies(
             context_pattern=f"%{topic}%", only_successful=True
@@ -180,6 +215,16 @@ class Memory:
             parts.append("\nPROVEN STRATEGIES:")
             for s in strategies[:3]:
                 parts.append(f"  - {s['strategy']}: {s['outcome'][:200]}")
+
+        failed = self._conn.execute(
+            "SELECT * FROM procedural WHERE context LIKE ? AND success = 0 "
+            "ORDER BY learned_at DESC LIMIT 5",
+            (f"%{topic}%",),
+        ).fetchall()
+        if failed:
+            parts.append("\nFAILURE PATTERNS TO AVOID:")
+            for row in failed:
+                parts.append(f"  - {row['strategy']}: {row['outcome'][:200]}")
 
         return "\n".join(parts) if parts else "No relevant memories found."
 
@@ -196,6 +241,10 @@ class Memory:
             ).fetchone()[0],
         }
 
+    def flush(self):
+        self._maybe_commit(force=True)
+
     def close(self):
         if self._conn:
+            self._maybe_commit(force=True)
             self._conn.close()

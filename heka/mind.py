@@ -9,7 +9,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 
@@ -34,10 +34,19 @@ class Mind:
         self.model = model
         self.persona = persona
         self.temperature = temperature
-        self._client = httpx.AsyncClient(base_url=OLLAMA_BASE, timeout=300.0)
+        self._client = httpx.AsyncClient(
+            base_url=OLLAMA_BASE,
+            timeout=300.0,
+            limits=httpx.Limits(
+                max_connections=30,
+                max_keepalive_connections=10,
+                keepalive_expiry=30.0,
+            ),
+        )
 
     async def think(self, prompt: str, context: str = "",
-                    temperature: float = None) -> Thought:
+                    temperature: float = None, num_predict: int = 1024,
+                    format_json: bool = False) -> Thought:
         messages = [
             {"role": "system", "content": self.persona},
         ]
@@ -45,34 +54,41 @@ class Mind:
             messages.append({"role": "user", "content": f"Context:\n{context}"})
         messages.append({"role": "user", "content": prompt})
 
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "temperature": temperature if temperature is not None else self.temperature,
+                "num_predict": num_predict,
+            },
+        }
+        if format_json:
+            payload["format"] = "json"
+
         try:
-            response = await self._client.post("/api/chat", json={
-                "model": self.model,
-                "messages": messages,
-                "stream": False,
-                "options": {
-                    "temperature": temperature if temperature is not None else self.temperature,
-                    "num_predict": 4096,
-                },
-            })
+            response = await self._client.post("/api/chat", json=payload)
             response.raise_for_status()
             data = response.json()
-            content = data["message"]["content"]
+            content = data.get("message", {}).get("content", "").strip()
 
             return Thought(mind=self.name, content=content, confidence=0.7)
         except Exception as e:
             log.error(f"{self.name} failed to think: {e}")
             return Thought(mind=self.name, content=f"[ERROR: {e}]", confidence=0.0)
 
-    async def generate_json(self, prompt: str, context: str = "") -> Optional[dict]:
+    async def generate_json(self, prompt: str, context: str = "",
+                            num_predict: int = 512) -> Optional[Any]:
         thought = await self.think(
             prompt + "\n\nRespond with valid JSON only. No markdown, no explanation.",
             context=context,
-            temperature=0.3,
+            temperature=0.2,
+            num_predict=num_predict,
+            format_json=True,
         )
         if thought.confidence == 0.0:
             return None
-        text = thought.content.strip()
+        text = thought.content.strip() or "{}"
         # Strip markdown code fences
         if text.startswith("```"):
             lines = text.split("\n")
@@ -86,12 +102,43 @@ class Mind:
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", text, re.DOTALL)
-            if match:
+            candidates = []
+            match_obj = re.search(r"\{.*\}", text, re.DOTALL)
+            if match_obj:
+                candidates.append(match_obj.group())
+            match_arr = re.search(r"\[.*\]", text, re.DOTALL)
+            if match_arr:
+                candidates.append(match_arr.group())
+
+            for candidate in candidates:
                 try:
-                    return json.loads(match.group())
+                    return json.loads(candidate)
                 except json.JSONDecodeError:
-                    pass
+                    continue
+
+            start = -1
+            for i, ch in enumerate(text):
+                if ch in "{[":
+                    start = i
+                    break
+            if start >= 0:
+                stack = []
+                pairs = {"}": "{", "]": "["}
+                for i in range(start, len(text)):
+                    ch = text[i]
+                    if ch in "{[":
+                        stack.append(ch)
+                    elif ch in "}]":
+                        if not stack or stack[-1] != pairs[ch]:
+                            break
+                        stack.pop()
+                        if not stack:
+                            fragment = text[start:i + 1]
+                            try:
+                                return json.loads(fragment)
+                            except json.JSONDecodeError:
+                                break
+
             log.warning(f"{self.name} produced invalid JSON: {text[:200]}")
             return None
 
