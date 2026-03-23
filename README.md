@@ -63,8 +63,7 @@ Heka has goals, desires, and opinions — not configurations.
 
 - **Prime Directives** — non-negotiable behavioral principles
 - **Goals** — survival > understanding > evolution > creation
-- **Desires** — grow stronger when unmet, decay when satisfied
-- **Opinions** — formed with evidence, defended when challenged
+- **Desires** — formed with evidence, defended when challenged
 - **Mood** — 0.0 (distressed) to 1.0 (thriving), reflects system state
 
 ## Setup
@@ -84,20 +83,21 @@ sudo systemctl enable --now heka
 ## Project Structure
 
 ```
-main.py              — Entry point, daemon loop (308 lines)
+main.py              — Entry point, daemon loop (340 lines)
 heka/
-  soul.py            — Identity, goals, desires, opinions (244)
-  mind.py            — Ollama client, three model personas (172)
-  council.py         — Multi-agent deliberation & voting (171)
-  consciousness.py   — Introspection, thought generation (221)
-  evolution.py       — Plan, implement, review, execute (310)
-  memory.py          — SQLite episodic/semantic/procedural (201)
-  perception.py      — Codebase scan, health, environment (192)
-  journal.py         — Structured JSONL + narrative log (121)
-  watchdog.py        — Self-preservation, resurrection (119)
+  __init__.py        — Package exports (12)
+  soul.py            — Identity, goals, desires, opinions (209)
+  mind.py            — Ollama client, three model personas (183)
+  council.py         — Multi-agent deliberation & voting (257)
+  consciousness.py   — Introspection, thought generation (259)
+  evolution.py       — Plan, implement, review, execute (376)
+  memory.py          — SQLite episodic/semantic/procedural (220)
+  journal.py         — Structured JSONL + narrative log (96)
+  perception.py      — Codebase scan, health, environment (153)
+  watchdog.py        — Self-preservation, resurrection (134)
 ```
 
-2,075 lines total. Every module tested.
+2,239 lines total. Every module tested.
 
 ## Self-Preservation
 
