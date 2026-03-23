@@ -214,6 +214,11 @@ async def run():
                             ),
                         )
 
+                        # Update README if evolution succeeded
+                        if result.success:
+                            log.info("  Updating README...")
+                            await evolution.update_readme(result, plan)
+
                         await consciousness.reflect({
                             "success": result.success,
                             "action": plan.action,

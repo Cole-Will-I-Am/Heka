@@ -302,6 +302,77 @@ Requirements:
                 rollback_performed=True,
             )
 
+    async def update_readme(self, result: EvolutionResult, plan: EvolutionPlan):
+        """Have the Architect update README.md to reflect what changed."""
+        readme_path = self.base_path / "README.md"
+        if not readme_path.exists():
+            return
+
+        current_readme = readme_path.read_text(errors="replace")
+
+        # Scan current project structure for accuracy
+        py_files = sorted(self.base_path.rglob("*.py"))
+        py_files = [
+            f for f in py_files
+            if not any(
+                p.startswith(".") or p == "__pycache__"
+                for p in f.relative_to(self.base_path).parts
+            )
+        ]
+        file_list = []
+        for f in py_files:
+            try:
+                loc = len([
+                    l for l in f.read_text(errors="replace").split("\n")
+                    if l.strip() and not l.strip().startswith("#")
+                ])
+                file_list.append(f"{f.relative_to(self.base_path)} ({loc} lines)")
+            except Exception:
+                file_list.append(str(f.relative_to(self.base_path)))
+
+        prompt = f"""The project just evolved. Update the README.md to reflect the current state.
+
+WHAT CHANGED THIS CYCLE:
+  Action: {plan.action}
+  Files affected: {result.files_affected}
+  Reasoning: {plan.reasoning}
+
+CURRENT PROJECT FILES:
+{chr(10).join(f'  - {f}' for f in file_list)}
+
+CURRENT README:
+{current_readme}
+
+Rules:
+- Keep the existing structure and tone
+- Update the Project Structure section to match current files and line counts
+- Update the total line count
+- If new capabilities were added, mention them briefly
+- Do NOT remove existing sections
+- Do NOT add fluff — keep it tight
+- Output ONLY the complete updated README.md content"""
+
+        thought = await self.architect.think(prompt, temperature=0.3)
+        new_readme = thought.content.strip()
+
+        # Strip markdown fences if the model wrapped it
+        if new_readme.startswith("```"):
+            lines = new_readme.split("\n")
+            end = len(lines)
+            for i in range(len(lines) - 1, 0, -1):
+                if lines[i].strip().startswith("```"):
+                    end = i
+                    break
+            new_readme = "\n".join(lines[1:end])
+
+        # Sanity check — must still look like a README
+        if len(new_readme) < 200 or "# Heka" not in new_readme:
+            log.warning("Architect produced invalid README update — skipping")
+            return
+
+        readme_path.write_text(new_readme)
+        log.info("README.md updated by Architect")
+
     def _rollback(self, backups: dict[str, Path]):
         for path, backup_path in backups.items():
             full_path = self.base_path / path
