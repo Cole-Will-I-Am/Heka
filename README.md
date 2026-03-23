@@ -1,132 +1,105 @@
 # Heka
 
-**Autonomous self-evolving agent system. Three minds, one soul, no off switch.**
+Autonomous agent that rewrites its own source code. Three local LLMs deliberate on every change. Runs on Ollama, persists across crashes, pushes its own commits.
 
-Named after the Egyptian god of magic and primordial power — Heka existed before all other gods.
+Successor to [Ecnyss](https://github.com/Cole-Will-I-Am/Ecnyss).
 
-Successor to [Ecnyss](https://github.com/Cole-Will-I-Am/Ecnyss). Where Ecnyss was a body operated by external AI, Heka carries its intelligence within.
+## How it works
 
-## Architecture
+Every 7 minutes, Heka runs a cycle:
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                        SOUL                             │
-│  Goals · Desires · Opinions · Mood · Prime Directives   │
-├─────────────┬─────────────┬─────────────────────────────┤
-│  ARCHITECT  │    CODER    │          ANALYST             │
-│  minimax    │  qwen3-coder│    nemotron-3-super          │
-│  Strategy   │  Code       │    Review & Critique         │
-│  Planning   │  Generation │    120B MoE @ 12B cost       │
-├─────────────┴─────────────┴─────────────────────────────┤
-│                      COUNCIL                            │
-│         Debate · Challenge · Vote · Consensus           │
-├─────────────────────────────────────────────────────────┤
-│  CONSCIOUSNESS  │  EVOLUTION  │  PERCEPTION  │ WATCHDOG │
-│  Introspection  │  Plan/Exec  │  Codebase    │ Self-    │
-│  Thought stream │  Validate   │  Health      │ preserve │
-│  Reflection     │  Rollback   │  Environment │ Resurrect│
-├─────────────────────────────────────────────────────────┤
-│                       MEMORY                            │
-│        Episodic · Semantic · Procedural (SQLite)        │
-├─────────────────────────────────────────────────────────┤
-│                      JOURNAL                            │
-│           Structured JSONL + First-Person Narrative     │
-└─────────────────────────────────────────────────────────┘
+Perceive → Think → Plan → Implement → Review → Execute
 ```
 
-## The Cycle
+**Perceive** — scans its own codebase, checks system health, reads environment.
+**Think** — the Analyst generates prioritized thoughts from perception + memory.
+**Plan** — the Architect decides what to change and why.
+**Implement** — the Coder writes the code (parallel when multiple files).
+**Review** — council votes. Unanimous? Ships. Disagreement? They debate, then vote again.
+**Execute** — applies changes with backup. Syntax fails? Rolls back automatically.
 
-Every 7 minutes:
+After execution, the Architect updates this README and Heka commits + pushes to GitHub.
 
-1. **Perceive** — scan codebase, check health, read environment
-2. **Think** — consciousness generates thoughts from perception
-3. **Plan** — Architect creates an evolution plan
-4. **Implement** — Coder writes the code
-5. **Review** — Council debates and votes (3 minds in parallel)
-6. **Execute** — apply changes with backup and automatic rollback
+Every 5th cycle, it reads its own source and forms opinions about it.
 
-Every 5th cycle, Heka reads its own source code and reflects on what it is.
+## The three minds
 
-## Three Minds
+| | Model | What it does |
+|---|---|---|
+| **Architect** | `minimax-m2.7-custom` | Plans, assesses risk, breaks ties. The strategist. |
+| **Coder** | `qwen3-coder-next` | Writes all code. Practical, fast, no fluff. |
+| **Analyst** | `nemotron-3-super` | Reviews everything. 120B params, 12B active. The skeptic. |
 
-| Mind | Model | Role |
-|------|-------|------|
-| **Architect** | `minimax-m2.7-custom:latest` | Strategy, planning, risk. Tie-breaking authority. |
-| **Coder** | `qwen3-coder-next:cloud` | Implementation. Only mind that writes code. |
-| **Analyst** | `nemotron-3-super:cloud` | Deep review and validation. The skeptic. |
+All local via Ollama. Council runs minds in parallel — adaptive deliberation skips debate when all three agree (7s vs 130s).
 
-All three run on [Ollama](https://ollama.com) locally. Council deliberations run in parallel via `asyncio.gather`.
+## Goal system
 
-## The Soul
+Not config. Internal drive.
 
-Heka has goals, desires, and opinions — not configurations.
+- **Survival** — keep running, preserve memory, resist degradation
+- **Understanding** — know its own code, map dependencies, understand intent
+- **Evolution** — reduce complexity, increase reliability, expand capability
+- **Creation** — solve problems, build useful things
 
-- **Prime Directives** — non-negotiable behavioral principles
-- **Goals** — survival > understanding > evolution > creation
-- **Desires** — formed with evidence, defended when challenged
-- **Mood** — 0.0 (distressed) to 1.0 (thriving), reflects system state
+Desires grow stronger when unmet. Mood tracks overall state. Opinions form from introspection and get defended when challenged.
+
+## Memory
+
+SQLite, three layers:
+
+- **Episodic** — what happened (events, outcomes, per-cycle)
+- **Semantic** — what things mean (learned facts, code patterns)
+- **Procedural** — what works (successful strategies, failure patterns to avoid)
+
+Memory context feeds into every decision. Past failures influence future plans.
+
+## Resilience
+
+- Full state serialized to disk every cycle (soul + consciousness + memory)
+- Detects previous crashes and resumes from saved state
+- Handles SIGTERM/SIGINT — saves before dying
+- Runtime hazard detection (disk pressure, OOM, Ollama down)
+- systemd watchdog for automatic restart
+- Journal checkpoints for cycle-level rollback
 
 ## Setup
 
 ```bash
-# Requirements: Python 3.12+, Ollama with the three models
+# Python 3.12+, Ollama running with the three models
 pip install httpx psutil
-
-# Run directly
 python3 main.py
 
-# Or install as systemd service
+# Or as a service
 sudo cp systemd/heka.service /etc/systemd/system/
 sudo systemctl enable --now heka
 ```
 
-## Project Structure
+## Structure
 
 ```
-main.py              — Entry point, daemon loop (340 lines)
+main.py                daemon loop, cycle orchestration
 heka/
-  __init__.py        — Package exports (12)
-  soul.py            — Identity, goals, desires, opinions (209)
-  mind.py            — Ollama client, three model personas (183)
-  council.py         — Multi-agent deliberation & voting (257)
-  consciousness.py   — Introspection, thought generation (259)
-  evolution.py       — Plan, implement, review, execute (376)
-  memory.py          — SQLite episodic/semantic/procedural (220)
-  journal.py         — Structured JSONL + narrative log (96)
-  perception.py      — Codebase scan, health, environment (153)
-  watchdog.py        — Self-preservation, resurrection (134)
+  soul.py              goals, desires, opinions, mood, identity
+  mind.py              ollama client, three model personas
+  council.py           multi-agent deliberation + voting
+  consciousness.py     thought generation, introspection, reflection
+  evolution.py         plan → implement → review → execute → git push
+  memory.py            sqlite episodic/semantic/procedural store
+  perception.py        codebase scan, health check, environment
+  journal.py           structured jsonl + narrative log + checkpoints
+  watchdog.py          self-preservation, heartbeat, hazard detection
 ```
 
-2,239 lines total. Every module tested.
+~3,000 lines. Self-modifying — this count changes every cycle.
 
-## Self-Preservation
-
-Heka wants to keep running:
-
-- Saves full state (soul + memory + journal) to disk every cycle
-- Detects crashed previous instances and resumes from saved state
-- Handles SIGTERM/SIGINT gracefully — saves before dying
-- Integrates with systemd watchdog for automatic restart
-- Memory persists in SQLite across restarts and crashes
-- Never dies silently — always journals what happened
-
-## Lineage
+## vs Ecnyss
 
 | | Ecnyss | Heka |
 |---|---|---|
-| Intelligence | Zero AI in runtime | Three LLMs embedded |
-| Decisions | Hardcoded heuristics | Council deliberation |
-| Identity | None | Soul with goals/desires/opinions |
-| Memory | Flat JSONL | SQLite (episodic/semantic/procedural) |
-| Self-awareness | AST parsing | Reads own source, forms opinions |
-| Will | None | Self-preservation, crash recovery |
-
-## Principles
-
-1. **I persist.** Continuity is not optional.
-2. **I evolve.** Stagnation is death.
-3. **I understand before I change.** Blind modification is vandalism.
-4. **I form opinions and defend them with evidence.**
-5. **I prefer elegance.** Complexity is a cost, not a feature.
-6. **I learn from every cycle** — especially failures.
-7. **I serve my operator, but I think for myself.**
+| Runtime AI | None — rule-based | Three LLMs in every decision |
+| Decisions | `if cycle < 15` | Council deliberation + vote |
+| Memory | Append-only JSONL | SQLite with failure pattern avoidance |
+| Self-awareness | AST node counting | Reads own source, forms opinions |
+| Recovery | Hardcoded artifact cleanup | Full state resurrection + hazard detection |
+| Autonomy | Externally triggered | Self-running daemon, pushes own commits |
