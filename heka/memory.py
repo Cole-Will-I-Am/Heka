@@ -23,8 +23,8 @@ class Memory:
     - Procedural: How to do things (successful strategies, failure patterns)
     """
 
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
+    def __init__(self, db_path: Path | str):
+        self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
         self._init_db()

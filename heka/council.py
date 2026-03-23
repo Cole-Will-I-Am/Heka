@@ -62,15 +62,20 @@ class Council:
             f"Provide your analysis and recommendation. Be specific and concise."
         )
 
-        # Round 1: Initial thoughts
-        for mind in [self.architect, self.coder, self.analyst]:
-            thought = await mind.think(initial_prompt, context=context)
-            delib.thoughts.append(thought)
-            log.info(f"  {mind.name}: {thought.content[:120]}...")
+        # Round 1: Initial thoughts (parallel)
+        import asyncio as _aio
+        initial_thoughts = await _aio.gather(
+            self.architect.think(initial_prompt, context=context),
+            self.coder.think(initial_prompt, context=context),
+            self.analyst.think(initial_prompt, context=context),
+        )
+        delib.thoughts.extend(initial_thoughts)
+        for t in initial_thoughts:
+            log.info(f"  {t.mind}: {t.content[:120]}...")
 
         delib.rounds = 1
 
-        # Round 2: Debate — each mind responds to others
+        # Round 2: Debate — each mind responds to others (parallel)
         if max_rounds > 1:
             others_summary = "\n\n".join(
                 f"{t.mind.upper()}: {t.content}" for t in delib.thoughts
@@ -80,21 +85,30 @@ class Council:
                 f"Do you agree or disagree? Challenge weak points. Be direct."
             )
 
-            for mind in [self.architect, self.coder, self.analyst]:
-                thought = await mind.think(debate_prompt, context=context)
-                delib.thoughts.append(thought)
+            debate_thoughts = await _aio.gather(
+                self.architect.think(debate_prompt, context=context),
+                self.coder.think(debate_prompt, context=context),
+                self.analyst.think(debate_prompt, context=context),
+            )
+            delib.thoughts.extend(debate_thoughts)
 
             delib.rounds = 2
 
-        # Vote
+        # Vote (parallel)
         vote_prompt = (
             f"Based on the deliberation about '{topic}', cast your vote.\n\n"
             f'Respond with JSON: {{"position": "approve|reject|abstain", '
             f'"reasoning": "your reasoning", "confidence": 0.0-1.0}}'
         )
 
-        for mind in [self.architect, self.coder, self.analyst]:
-            vote_data = await mind.generate_json(vote_prompt, context=context)
+        vote_results = await _aio.gather(
+            self.architect.generate_json(vote_prompt, context=context),
+            self.coder.generate_json(vote_prompt, context=context),
+            self.analyst.generate_json(vote_prompt, context=context),
+        )
+        for mind, vote_data in zip(
+            [self.architect, self.coder, self.analyst], vote_results
+        ):
             if vote_data:
                 delib.votes.append(Vote(
                     mind=mind.name,

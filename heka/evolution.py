@@ -50,14 +50,14 @@ class EvolutionResult:
 class Evolution:
     """Changes don't happen without going through here."""
 
-    def __init__(self, base_path: Path, architect: Mind, coder: Mind,
+    def __init__(self, base_path: Path | str, architect: Mind, coder: Mind,
                  council: Council, memory: Memory):
-        self.base_path = base_path
+        self.base_path = Path(base_path)
         self.architect = architect
         self.coder = coder
         self.council = council
         self.memory = memory
-        self.backup_dir = base_path / ".heka" / "backups"
+        self.backup_dir = self.base_path / ".heka" / "backups"
         self.backup_dir.mkdir(parents=True, exist_ok=True)
 
     async def plan(self, thoughts: list, perception: dict,

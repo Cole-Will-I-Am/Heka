@@ -28,10 +28,10 @@ class Entry:
 class Journal:
     """Appends structured entries to JSONL + human-readable narrative."""
 
-    def __init__(self, base_path: Path):
-        self.base_path = base_path
-        self.journal_path = base_path / ".heka" / "journal.jsonl"
-        self.narrative_path = base_path / ".heka" / "narrative.log"
+    def __init__(self, base_path: Path | str):
+        self.base_path = Path(base_path)
+        self.journal_path = self.base_path / ".heka" / "journal.jsonl"
+        self.narrative_path = self.base_path / ".heka" / "narrative.log"
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
 
     def record(self, cycle: int, event: str, category: str, data: dict,

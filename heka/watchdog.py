@@ -29,9 +29,9 @@ class Watchdog:
     - Integrates with systemd for automatic restart
     """
 
-    def __init__(self, base_path: Path):
-        self.base_path = base_path
-        self.state_dir = base_path / ".heka"
+    def __init__(self, base_path: Path | str):
+        self.base_path = Path(base_path)
+        self.state_dir = self.base_path / ".heka"
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.heartbeat_path = self.state_dir / "heartbeat.json"
         self.state_path = self.state_dir / "daemon_state.json"

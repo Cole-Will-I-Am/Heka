@@ -21,8 +21,8 @@ log = logging.getLogger("heka.perception")
 class Perception:
     """Gathers and structures information about the world Heka inhabits."""
 
-    def __init__(self, base_path: Path):
-        self.base_path = base_path
+    def __init__(self, base_path: Path | str):
+        self.base_path = Path(base_path)
 
     def perceive(self) -> dict:
         return {

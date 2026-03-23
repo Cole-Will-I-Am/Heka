@@ -71,8 +71,8 @@ class Opinion:
         return f"On '{self.topic}': {self.position}. Evidence: {self.evidence} (defended {self.times_defended}x)"
 
     def challenge(self, counter_evidence: str, counter_confidence: float) -> bool:
-        """Returns True if opinion should change — requires strong counter-evidence."""
-        return counter_confidence > self.confidence + 0.2
+        """Returns True if opinion should change — requires meaningfully higher confidence."""
+        return counter_confidence > self.confidence * 1.1
 
 
 class Soul:
