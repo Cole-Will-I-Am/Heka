@@ -31,7 +31,7 @@ Every 5th cycle, it reads its own source and forms opinions about it.
 | **Coder** | `qwen3-coder-next` | Writes all code. Practical, fast, no fluff. |
 | **Analyst** | `nemotron-3-super` | Reviews everything. 120B params, 12B active. The skeptic. |
 
-All local via Ollama. Council runs minds in parallel — adaptive deliberation skips debate when all three agree (7s vs 130s).
+All local via Ollama. Council runs minds in parallel — adaptive deliberation skips debate when all three agree (14s vs 130s).
 
 ## Goal system
 
