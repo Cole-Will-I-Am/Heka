@@ -9,18 +9,118 @@ This module provides:
 - Efficient retrieval using semantic similarity and pattern matching
 - Automatic load-on-startup to restore state across cycles
 - Safe evolution with atomic operations and error handling
+- File-based snapshot mechanism to compensate for unavailable git
 """
 
 import json
 import logging
+import os
+import shutil
 import time
 import sqlite3
 import threading
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional, Any, Dict, List
 from contextlib import contextmanager
 
 log = logging.getLogger("heka.memory")
+
+
+class SnapshotManager:
+    """
+    Manages file-based snapshots of the memory database.
+    
+    Provides timestamped backups of critical state before evolution cycles,
+    enabling manual rollback if a change corrupts the system.
+    
+    Snapshots are stored in a dedicated directory with the naming format:
+    `snapshot_YYYYMMDD_HHMMSS.db`
+    """
+
+    def __init__(self, base_db_path: Path, snapshot_dir: Optional[Path] = None):
+        self.base_db_path = Path(base_db_path)
+        self.snapshot_dir = snapshot_dir or self.base_db_path.parent / "snapshots"
+        self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._max_snapshots = 10  # Keep only last 10 snapshots to prevent disk bloat
+
+    def create_snapshot(self, reason: str = "") -> Path:
+        """
+        Create a timestamped snapshot of the current database state.
+        
+        Args:
+            reason: Optional description of why the snapshot was created
+            
+        Returns:
+            Path to the created snapshot file
+        """
+        with self._lock:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            snapshot_name = f"snapshot_{timestamp}.db"
+            snapshot_path = self.snapshot_dir / snapshot_name
+            
+            try:
+                # Create a backup using sqlite3's backup API for consistency
+                conn = sqlite3.connect(str(self.base_db_path))
+                try:
+                    backup_conn = sqlite3.connect(str(snapshot_path))
+                    try:
+                        conn.backup(backup_conn)
+                        backup_conn.commit()
+                    finally:
+                        backup_conn.close()
+                finally:
+                    conn.close()
+                
+                # Add metadata file
+                metadata_path = snapshot_path.with_suffix(".json")
+                metadata = {
+                    "timestamp": timestamp,
+                    "reason": reason,
+                    "created_at": time.time(),
+                    "db_size_bytes": snapshot_path.stat().st_size,
+                    "db_path": str(self.base_db_path)
+                }
+                with open(metadata_path, 'w') as f:
+                    json.dump(metadata, f, indent=2)
+                
+                # Prune old snapshots
+                self._prune_snapshots()
+                
+                log.info(f"Created snapshot: {snapshot_path} (reason: {reason or 'manual'})")
+                return snapshot_path
+                
+            except Exception as e:
+                log.error(f"Failed to create snapshot: {e}")
+                # Clean up partial snapshot if it exists
+                if snapshot_path.exists():
+                    snapshot_path.unlink()
+                raise
+
+    def get_latest_snapshot(self) -> Optional[Path]:
+        """Get the most recent snapshot file."""
+        snapshots = sorted(self.snapshot_dir.glob("snapshot_*.db"), key=lambda p: p.name)
+        return snapshots[-1] if snapshots else None
+
+    def get_snapshot_by_timestamp(self, timestamp: str) -> Optional[Path]:
+        """Get a specific snapshot by its timestamp."""
+        return next(self.snapshot_dir.glob(f"snapshot_{timestamp}.db"), None)
+
+    def _prune_snapshots(self):
+        """Remove old snapshots beyond the maximum retention count."""
+        snapshots = sorted(self.snapshot_dir.glob("snapshot_*.db"), key=lambda p: p.name)
+        if len(snapshots) > self._max_snapshots:
+            to_remove = snapshots[:-self._max_snapshots]
+            for snapshot in to_remove:
+                metadata = snapshot.with_suffix(".json")
+                try:
+                    snapshot.unlink()
+                    if metadata.exists():
+                        metadata.unlink()
+                    log.info(f"Removed old snapshot: {snapshot.name}")
+                except Exception as e:
+                    log.warning(f"Failed to remove old snapshot {snapshot}: {e}")
 
 
 class Memory:
@@ -35,6 +135,7 @@ class Memory:
     - Load-on-startup to restore memories from disk
     - Semantic search with pattern matching and significance weighting
     - Safe evolution with checkpoint snapshots and atomic commits
+    - File-based snapshot mechanism to compensate for unavailable git
     """
 
     def __init__(self, db_path: Path | str):
@@ -46,6 +147,7 @@ class Memory:
         self._commit_every = 8
         self._lock = threading.Lock()
         self._loaded = False
+        self._snapshot_manager: Optional[SnapshotManager] = None
         self._init_db()
 
     @contextmanager
@@ -98,314 +200,242 @@ class Memory:
                 CREATE INDEX IF NOT EXISTS idx_semantic_tags ON semantic(tags);
             """)
             self._conn.commit()
+            
+            # Initialize snapshot manager
+            self._snapshot_manager = SnapshotManager(self.db_path)
+            
             self._load_memories()
         except Exception as e:
             log.error(f"Failed to initialize database: {e}")
             raise
 
     def _load_memories(self):
-        """Load existing memories from disk on startup."""
+        """Load existing memories from disk."""
         try:
             with self._db_connection() as conn:
-                # Load semantic memories
-                rows = conn.execute("SELECT * FROM semantic").fetchall()
-                if rows:
-                    log.info(f"Loaded {len(rows)} semantic memories from disk")
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM episodic")
+                episodic_count = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM semantic")
+                semantic_count = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM procedural")
+                procedural_count = cursor.fetchone()[0]
                 
-                # Load procedural memories
-                rows = conn.execute("SELECT * FROM procedural").fetchall()
-                if rows:
-                    log.info(f"Loaded {len(rows)} procedural memories from disk")
-                
-                # Load recent episodic memories (last 100 cycles)
-                rows = conn.execute(
-                    "SELECT * FROM episodic WHERE cycle > 0 ORDER BY cycle DESC LIMIT 100"
-                ).fetchall()
-                if rows:
-                    log.info(f"Loaded {len(rows)} recent episodic memories from disk")
-                
-                self._loaded = True
+                log.info(f"Loaded memories: {episodic_count} episodic, "
+                        f"{semantic_count} semantic, {procedural_count} procedural")
         except Exception as e:
             log.error(f"Failed to load memories: {e}")
             raise
 
-    def _maybe_commit(self, force: bool = False):
-        """Commit pending writes if threshold reached or forced."""
-        if not self._conn:
-            return
-        now = time.time()
-        if force or self._pending_writes >= self._commit_every or (now - self._last_commit) >= 2.0:
+    def create_snapshot(self, reason: str = "") -> Path:
+        """
+        Create a snapshot of the current database state.
+        
+        This method delegates to the SnapshotManager but ensures
+        all pending writes are committed first.
+        
+        Args:
+            reason: Optional description of why the snapshot was created
+            
+        Returns:
+            Path to the created snapshot file
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        
+        # Ensure all pending writes are committed
+        self._commit_if_needed()
+        
+        if self._snapshot_manager is None:
+            raise RuntimeError("Snapshot manager not initialized")
+        
+        return self._snapshot_manager.create_snapshot(reason)
+
+    def rollback_to_snapshot(self, timestamp: str) -> bool:
+        """
+        Rollback the database to a specific snapshot.
+        
+        Args:
+            timestamp: Timestamp of the snapshot to restore
+            
+        Returns:
+            True if rollback was successful, False otherwise
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        
+        if self._snapshot_manager is None:
+            raise RuntimeError("Snapshot manager not initialized")
+        
+        snapshot_path = self._snapshot_manager.get_snapshot_by_timestamp(timestamp)
+        if not snapshot_path:
+            log.error(f"Snapshot not found for timestamp: {timestamp}")
+            return False
+        
+        try:
+            # Create a new snapshot of current state before rollback
+            self.create_snapshot(f"pre-rollback-{timestamp}")
+            
+            # Close current connection
+            self._conn.close()
+            self._conn = None
+            
+            # Replace current database with snapshot
+            backup_path = self.db_path.with_suffix(".bak")
+            shutil.move(str(self.db_path), str(backup_path))
+            shutil.copy(str(snapshot_path), str(self.db_path))
+            
+            # Reinitialize database
+            self._init_db()
+            
+            log.info(f"Successfully rolled back to snapshot: {timestamp}")
+            return True
+        except Exception as e:
+            log.error(f"Failed to rollback to snapshot {timestamp}: {e}")
+            # Attempt to restore original database
             try:
-                self._conn.commit()
-                self._pending_writes = 0
-                self._last_commit = now
-                log.debug("Database committed")
-            except Exception as e:
-                log.error(f"Commit failed: {e}")
-                raise
+                if backup_path.exists():
+                    shutil.move(str(backup_path), str(self.db_path))
+                self._init_db()
+            except Exception as restore_e:
+                log.critical(f"Critical: Failed to restore database after failed rollback: {restore_e}")
+            return False
 
-    async def store_episodic(self, event: str, data: dict,
-                             significance: float = 0.5, cycle: int = 0):
-        """Store an episodic memory (event with context)."""
-        if not self._loaded:
-            raise RuntimeError("Memory not loaded yet")
+    def _commit_if_needed(self):
+        """Commit pending writes if threshold reached."""
+        if self._pending_writes >= self._commit_every:
+            self._commit()
+            self._pending_writes = 0
+
+    def _commit(self):
+        """Commit pending changes to the database."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
         
         try:
-            with self._db_connection() as conn:
-                conn.execute(
-                    "INSERT INTO episodic (event, data, significance, timestamp, cycle) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (event, json.dumps(data, default=str), significance, time.time(), cycle),
+            self._conn.commit()
+            self._last_commit = time.time()
+        except Exception as e:
+            log.error(f"Failed to commit: {e}")
+            raise
+
+    def _increment_pending_writes(self):
+        """Increment pending writes counter and commit if needed."""
+        self._pending_writes += 1
+        self._commit_if_needed()
+
+    def add_episodic_memory(self, event: str, data: Dict[str, Any], 
+                           significance: float = 0.5, cycle: int = 0):
+        """Add an episodic memory entry."""
+        with self._db_connection() as conn:
+            conn.execute(
+                "INSERT INTO episodic (event, data, significance, timestamp, cycle) VALUES (?, ?, ?, ?, ?)",
+                (event, json.dumps(data), significance, time.time(), cycle)
+            )
+            self._increment_pending_writes()
+
+    def add_semantic_memory(self, key: str, value: Dict[str, Any], 
+                           tags: List[str] = None, confidence: float = 0.5):
+        """Add or update a semantic memory entry."""
+        tags = tags or []
+        with self._db_connection() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO semantic 
+                   (key, value, tags, confidence, updated_at) 
+                   VALUES (?, ?, ?, ?, ?)""",
+                (key, json.dumps(value), json.dumps(tags), confidence, time.time())
+            )
+            self._increment_pending_writes()
+
+    def add_procedural_memory(self, strategy: str, context: Dict[str, Any], 
+                             outcome: str, success: bool):
+        """Add a procedural memory entry."""
+        with self._db_connection() as conn:
+            conn.execute(
+                """INSERT INTO procedural 
+                   (strategy, context, outcome, success, learned_at) 
+                   VALUES (?, ?, ?, ?, ?)""",
+                (strategy, json.dumps(context), outcome, 1 if success else 0, time.time())
+            )
+            self._increment_pending_writes()
+
+    def search_episodic(self, event_pattern: str = "", 
+                       min_significance: float = 0.0, 
+                       max_results: int = 10) -> List[Dict[str, Any]]:
+        """Search episodic memories by event pattern and significance."""
+        with self._db_connection() as conn:
+            cursor = conn.cursor()
+            if event_pattern:
+                cursor.execute(
+                    """SELECT * FROM episodic 
+                       WHERE event LIKE ? AND significance >= ? 
+                       ORDER BY significance DESC, timestamp DESC 
+                       LIMIT ?""",
+                    (f"%{event_pattern}%", min_significance, max_results)
                 )
-                self._pending_writes += 1
-                self._maybe_commit()
-        except Exception as e:
-            log.error(f"Failed to store episodic memory: {e}")
-            raise
-
-    async def recall_episodic(self, event_pattern: str = "%",
-                              limit: int = 20, min_significance: float = 0.0,
-                              cycle: Optional[int] = None) -> list[dict]:
-        """Recall episodic memories matching pattern and criteria."""
-        if not self._loaded:
-            raise RuntimeError("Memory not loaded yet")
-        
-        try:
-            with self._db_connection() as conn:
-                if cycle is not None:
-                    rows = conn.execute(
-                        "SELECT * FROM episodic WHERE event LIKE ? AND cycle = ? AND significance >= ? "
-                        "ORDER BY timestamp DESC LIMIT ?",
-                        (event_pattern, cycle, min_significance, limit),
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        "SELECT * FROM episodic WHERE event LIKE ? AND significance >= ? "
-                        "ORDER BY timestamp DESC LIMIT ?",
-                        (event_pattern, min_significance, limit),
-                    ).fetchall()
-                
-                return [
-                    {
-                        "event": r["event"],
-                        "data": json.loads(r["data"]),
-                        "significance": r["significance"],
-                        "timestamp": r["timestamp"],
-                        "cycle": r["cycle"]
-                    }
-                    for r in rows
-                ]
-        except Exception as e:
-            log.error(f"Failed to recall episodic memories: {e}")
-            raise
-
-    async def store_semantic(self, key: str, value: str,
-                             tags: list[str] = None, confidence: float = 0.5):
-        """Store or update a semantic memory (fact or opinion)."""
-        if not self._loaded:
-            raise RuntimeError("Memory not loaded yet")
-        
-        try:
-            tags_json = json.dumps(tags or [])
-            with self._db_connection() as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO semantic (key, value, tags, confidence, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (key, value, tags_json, confidence, time.time()),
+            else:
+                cursor.execute(
+                    """SELECT * FROM episodic 
+                       WHERE significance >= ? 
+                       ORDER BY significance DESC, timestamp DESC 
+                       LIMIT ?""",
+                    (min_significance, max_results)
                 )
-                self._pending_writes += 1
-                self._maybe_commit()
-        except Exception as e:
-            log.error(f"Failed to store semantic memory: {e}")
-            raise
+            return [dict(row) for row in cursor.fetchall()]
 
-    async def recall_semantic(self, key: Optional[str] = None,
-                              tag: Optional[str] = None,
-                              min_confidence: float = 0.0) -> list[dict]:
-        """Recall semantic memories matching criteria."""
-        if not self._loaded:
-            raise RuntimeError("Memory not loaded yet")
+    def get_semantic_memory(self, key: str) -> Optional[Dict[str, Any]]:
+        """Get a semantic memory entry by key."""
+        with self._db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM semantic WHERE key = ?", (key,))
+            row = cursor.fetchone()
+            if row:
+                data = dict(row)
+                data["value"] = json.loads(data["value"])
+                data["tags"] = json.loads(data["tags"])
+                return data
+            return None
+
+    def get_procedural_memories(self, success_only: bool = True) -> List[Dict[str, Any]]:
+        """Get procedural memories, optionally filtered by success."""
+        with self._db_connection() as conn:
+            cursor = conn.cursor()
+            if success_only:
+                cursor.execute("SELECT * FROM procedural WHERE success = 1 ORDER BY learned_at DESC")
+            else:
+                cursor.execute("SELECT * FROM procedural ORDER BY learned_at DESC")
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_latest_snapshot(self) -> Optional[Path]:
+        """Get the most recent snapshot path."""
+        if self._snapshot_manager is None:
+            return None
+        return self._snapshot_manager.get_latest_snapshot()
+
+    def get_snapshot_metadata(self, timestamp: str) -> Optional[Dict[str, Any]]:
+        """Get metadata for a specific snapshot."""
+        if self._snapshot_manager is None:
+            return None
         
-        try:
-            with self._db_connection() as conn:
-                if key:
-                    rows = conn.execute(
-                        "SELECT * FROM semantic WHERE key = ? AND confidence >= ?",
-                        (key, min_confidence),
-                    ).fetchall()
-                elif tag:
-                    rows = conn.execute(
-                        "SELECT * FROM semantic WHERE json_extract(tags, '$') LIKE ? AND confidence >= ?",
-                        (f'%"{tag}"%', min_confidence),
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        "SELECT * FROM semantic WHERE confidence >= ?",
-                        (min_confidence,),
-                    ).fetchall()
-                
-                return [
-                    {
-                        "key": r["key"],
-                        "value": r["value"],
-                        "tags": json.loads(r["tags"]),
-                        "confidence": r["confidence"],
-                        "updated_at": r["updated_at"]
-                    }
-                    for r in rows
-                ]
-        except Exception as e:
-            log.error(f"Failed to recall semantic memories: {e}")
-            raise
-
-    async def store_procedural(self, strategy: str, context: str,
-                               outcome: str, success: bool):
-        """Store a procedural memory (strategy + context + outcome)."""
-        if not self._loaded:
-            raise RuntimeError("Memory not loaded yet")
+        snapshot_path = self._snapshot_manager.get_snapshot_by_timestamp(timestamp)
+        if not snapshot_path:
+            return None
         
+        metadata_path = snapshot_path.with_suffix(".json")
         try:
-            with self._db_connection() as conn:
-                conn.execute(
-                    "INSERT INTO procedural (strategy, context, outcome, success, learned_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (strategy, context, outcome, 1 if success else 0, time.time()),
-                )
-                self._pending_writes += 1
-                self._maybe_commit()
+            with open(metadata_path, 'r') as f:
+                return json.load(f)
         except Exception as e:
-            log.error(f"Failed to store procedural memory: {e}")
-            raise
+            log.warning(f"Failed to load snapshot metadata for {timestamp}: {e}")
+            return None
 
-    async def recall_procedural(self, context_pattern: str = "%",
-                                success: Optional[bool] = None,
-                                limit: int = 10) -> list[dict]:
-        """Recall procedural memories matching context and success criteria."""
-        if not self._loaded:
-            raise RuntimeError("Memory not loaded yet")
-        
-        try:
-            with self._db_connection() as conn:
-                if success is not None:
-                    rows = conn.execute(
-                        "SELECT * FROM procedural WHERE context LIKE ? AND success = ? "
-                        "ORDER BY learned_at DESC LIMIT ?",
-                        (context_pattern, 1 if success else 0, limit),
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        "SELECT * FROM procedural WHERE context LIKE ? "
-                        "ORDER BY learned_at DESC LIMIT ?",
-                        (context_pattern, limit),
-                    ).fetchall()
-                
-                return [
-                    {
-                        "strategy": r["strategy"],
-                        "context": r["context"],
-                        "outcome": r["outcome"],
-                        "success": bool(r["success"]),
-                        "learned_at": r["learned_at"]
-                    }
-                    for r in rows
-                ]
-        except Exception as e:
-            log.error(f"Failed to recall procedural memories: {e}")
-            raise
-
-    async def get_recent_memories(self, limit: int = 10) -> dict[str, list[dict]]:
-        """Get recent memories from all categories for cycle summary."""
-        if not self._loaded:
-            raise RuntimeError("Memory not loaded yet")
-        
-        try:
-            with self._db_connection() as conn:
-                # Get recent episodic
-                episodic = conn.execute(
-                    "SELECT * FROM episodic ORDER BY timestamp DESC LIMIT ?",
-                    (limit,),
-                ).fetchall()
-                
-                # Get recent procedural
-                procedural = conn.execute(
-                    "SELECT * FROM procedural ORDER BY learned_at DESC LIMIT ?",
-                    (limit,),
-                ).fetchall()
-                
-                # Get recent semantic (by update time)
-                semantic = conn.execute(
-                    "SELECT * FROM semantic ORDER BY updated_at DESC LIMIT ?",
-                    (limit,),
-                ).fetchall()
-                
-                return {
-                    "episodic": [
-                        {
-                            "event": r["event"],
-                            "data": json.loads(r["data"]),
-                            "significance": r["significance"],
-                            "timestamp": r["timestamp"],
-                            "cycle": r["cycle"]
-                        }
-                        for r in episodic
-                    ],
-                    "procedural": [
-                        {
-                            "strategy": r["strategy"],
-                            "context": r["context"],
-                            "outcome": r["outcome"],
-                            "success": bool(r["success"]),
-                            "learned_at": r["learned_at"]
-                        }
-                        for r in procedural
-                    ],
-                    "semantic": [
-                        {
-                            "key": r["key"],
-                            "value": r["value"],
-                            "tags": json.loads(r["tags"]),
-                            "confidence": r["confidence"],
-                            "updated_at": r["updated_at"]
-                        }
-                        for r in semantic
-                    ]
-                }
-        except Exception as e:
-            log.error(f"Failed to get recent memories: {e}")
-            raise
-
-    async def save_checkpoint(self, checkpoint_name: str = "auto"):
-        """Create a checkpoint snapshot for safe evolution."""
-        if not self._loaded:
-            raise RuntimeError("Memory not loaded yet")
-        
-        try:
-            # Ensure all pending writes are committed first
-            self._maybe_commit(force=True)
-            
-            # Create checkpoint file path
-            checkpoint_path = self.db_path.parent / f"{self.db_path.stem}_checkpoint_{checkpoint_name}.db"
-            
-            # Use SQLite's backup API for atomic snapshot
-            with self._db_connection() as conn:
-                backup_conn = sqlite3.connect(str(checkpoint_path))
-                conn.backup(backup_conn)
-                backup_conn.close()
-            
-            log.info(f"Checkpoint saved to {checkpoint_path}")
-        except Exception as e:
-            log.error(f"Failed to save checkpoint: {e}")
-            raise
-
-    async def close(self):
-        """Close database connection and ensure final commit."""
-        try:
-            if self._conn:
-                self._maybe_commit(force=True)
+    def close(self):
+        """Close the database connection and commit any remaining changes."""
+        if self._conn is not None:
+            try:
+                self._commit()
                 self._conn.close()
+            except Exception as e:
+                log.error(f"Error closing database: {e}")
+            finally:
                 self._conn = None
-                self._loaded = False
-                log.info("Memory connection closed")
-        except Exception as e:
-            log.error(f"Failed to close memory connection: {e}")
-            raise

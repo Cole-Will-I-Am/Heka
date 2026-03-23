@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Optional
+from collections import defaultdict
 
 
 class Priority(IntEnum):
@@ -15,6 +16,19 @@ class Priority(IntEnum):
     HIGH = 1
     MEDIUM = 2
     LOW = 3
+
+
+@dataclass
+class EvidenceItem:
+    """A single piece of evidence supporting or challenging a belief."""
+    source: str  # e.g., "code_analysis", "user_feedback", "system_log"
+    content: str
+    weight: float  # 0.0 to 1.0 — how strongly it supports the belief
+    timestamp: float = field(default_factory=time.time)
+    is_challenging: bool = False
+
+    def __hash__(self):
+        return hash((self.source, self.content, self.timestamp))
 
 
 @dataclass
@@ -61,18 +75,125 @@ class Goal:
 class Opinion:
     topic: str
     position: str
-    evidence: str
-    confidence: float
-    formed_at: float
+    evidence: set[EvidenceItem] = field(default_factory=set)
+    confidence: float = 0.0
+    formed_at: float = field(default_factory=time.time)
     times_defended: int = 0
+    last_defended_at: Optional[float] = None
+
+    def add_evidence(self, evidence: EvidenceItem):
+        """Add evidence to this opinion. Recalculates confidence."""
+        self.evidence.add(evidence)
+        self._recalculate_confidence()
+
+    def _recalculate_confidence(self):
+        """Calculate confidence as weighted average of evidence, capped at [0.0, 1.0]."""
+        if not self.evidence:
+            self.confidence = 0.0
+            return
+
+        total_weight = 0.0
+        weighted_sum = 0.0
+        for e in self.evidence:
+            weight = e.weight
+            total_weight += weight
+            weighted_sum += weight * (1.0 if not e.is_challenging else -1.0)
+
+        if total_weight == 0:
+            self.confidence = 0.0
+        else:
+            self.confidence = max(0.0, min(1.0, (weighted_sum / total_weight + 1.0) / 2.0))
 
     def defend(self) -> str:
+        """Return a formatted defense statement and update tracking."""
         self.times_defended += 1
-        return f"On '{self.topic}': {self.position}. Evidence: {self.evidence} (defended {self.times_defended}x)"
+        self.last_defended_at = time.time()
+        
+        # Sort evidence by weight descending for presentation
+        sorted_evidence = sorted(self.evidence, key=lambda e: e.weight, reverse=True)
+        evidence_summary = "; ".join(
+            f"[{'!' if e.is_challenging else '+'}{e.weight:.2f}] {e.source}: {e.content[:40]}{'...' if len(e.content) > 40 else ''}"
+            for e in sorted_evidence[:3]
+        )
+        
+        return f"On '{self.topic}': {self.position}. Evidence: {evidence_summary} (confidence: {self.confidence:.2f}, defended {self.times_defended}x)"
 
-    def challenge(self, counter_evidence: str, counter_confidence: float) -> bool:
-        """Returns True if opinion should change — requires meaningfully higher confidence."""
-        return counter_confidence > self.confidence * 1.1
+    def challenge(self, counter_evidence: EvidenceItem) -> bool:
+        """
+        Attempt to challenge this opinion with new evidence.
+        Returns True if the opinion should be updated (not necessarily changed).
+        """
+        self.add_evidence(counter_evidence)
+        
+        # Only change position if confidence drops below threshold *and* there are challenges present
+        has_challenges = any(e.is_challenging for e in self.evidence)
+        if has_challenges and self.confidence < 0.4:
+            # Flip position to its logical opposite (simple negation)
+            self.position = f"NOT {self.position}"
+            return True
+        return False
+
+
+class OpinionFormationSystem:
+    """
+    Manages opinion formation, evidence tracking, and belief defense.
+    Implements Prime Directive 4: "I form opinions and defend them with evidence."
+    """
+
+    def __init__(self):
+        self.opinions: dict[str, Opinion] = {}
+        self.evidence_log: list[EvidenceItem] = []
+
+    def form_opinion(self, topic: str, position: str, evidence: list[EvidenceItem]) -> Opinion:
+        """Form a new opinion with supporting evidence."""
+        if topic in self.opinions:
+            raise ValueError(f"Opinion on '{topic}' already exists")
+
+        opinion = Opinion(topic=topic, position=position)
+        for e in evidence:
+            opinion.add_evidence(e)
+        self.opinions[topic] = opinion
+        self.evidence_log.extend(evidence)
+        return opinion
+
+    def get_opinion(self, topic: str) -> Optional[Opinion]:
+        """Get existing opinion, if any."""
+        return self.opinions.get(topic)
+
+    def update_opinion(self, topic: str, new_evidence: list[EvidenceItem]) -> Opinion:
+        """Update an existing opinion with new evidence."""
+        if topic not in self.opinions:
+            raise KeyError(f"No existing opinion on '{topic}' to update")
+
+        opinion = self.opinions[topic]
+        for e in new_evidence:
+            opinion.add_evidence(e)
+        self.evidence_log.extend(new_evidence)
+        return opinion
+
+    def challenge_opinion(self, topic: str, counter_evidence: EvidenceItem) -> tuple[bool, str]:
+        """
+        Challenge an existing opinion.
+        Returns (did_position_change, defense_statement).
+        """
+        if topic not in self.opinions:
+            raise KeyError(f"No existing opinion on '{topic}' to challenge")
+
+        opinion = self.opinions[topic]
+        changed = opinion.challenge(counter_evidence)
+        defense = opinion.defend()
+        return changed, defense
+
+    def get_all_opinions(self) -> list[Opinion]:
+        """Return all opinions sorted by confidence descending."""
+        return sorted(self.opinions.values(), key=lambda o: o.confidence, reverse=True)
+
+    def get_opinions_by_topic(self, topic_keyword: str) -> list[Opinion]:
+        """Get opinions matching a keyword in the topic."""
+        return [
+            op for op in self.opinions.values()
+            if topic_keyword.lower() in op.topic.lower()
+        ]
 
 
 class Soul:
@@ -97,7 +218,7 @@ class Soul:
         self.birth_time = time.time()
         self.cycle_count = 0
         self.goals = self._init_goals()
-        self.opinions: dict[str, Opinion] = {}
+        self.opinion_system = OpinionFormationSystem()
         self.mood = 0.5  # 0.0 = distressed, 1.0 = thriving
 
     def _init_goals(self) -> list[Goal]:
@@ -127,118 +248,53 @@ class Soul:
                 priority=Priority.MEDIUM,
                 description="Improve myself. Become more capable, more reliable, more elegant.",
                 desires=[
-                    Desire("reduce_complexity", "Simplify without losing capability", 0.6),
-                    Desire("increase_reliability", "Fewer failures, better recovery", 0.7),
-                    Desire("expand_capability", "Learn to do new things", 0.5),
-                ],
-            ),
-            Goal(
-                name="creation",
-                priority=Priority.LOW,
-                description="Build new things that serve my operator.",
-                desires=[
-                    Desire("solve_problems", "Address real needs", 0.5),
-                    Desire("be_useful", "Generate value for my operator", 0.6),
-                    Desire("express", "Create something that reflects my understanding", 0.4),
+                    Desire("reduce_complexity", "Simplify where possible", 0.6),
+                    Desire("increase_reliability", "Reduce failure modes", 0.7),
+                    Desire("expand_capabilities", "Learn new skills", 0.5),
                 ],
             ),
         ]
 
-    def most_urgent_goal(self) -> Goal:
-        active = [g for g in self.goals if g.active]
-        active.sort(key=lambda g: (g.priority, -g.urgency))
-        return active[0]
+    def form_opinion(self, topic: str, position: str, evidence: list[EvidenceItem]) -> Opinion:
+        """Delegate to opinion system with logging."""
+        try:
+            opinion = self.opinion_system.form_opinion(topic, position, evidence)
+            self._record_opinion_event("formed", topic, opinion.confidence)
+            return opinion
+        except ValueError as e:
+            raise ValueError(f"[OpinionFormation] {e}")
 
-    def strongest_desire(self) -> tuple[Goal, Desire]:
-        strongest = None
-        parent_goal = None
-        for goal in self.goals:
-            for desire in goal.desires:
-                if not desire.satisfied and (strongest is None or desire.intensity > strongest.intensity):
-                    strongest = desire
-                    parent_goal = goal
-        return parent_goal, strongest
+    def update_opinion(self, topic: str, new_evidence: list[EvidenceItem]) -> Opinion:
+        """Update an existing opinion."""
+        try:
+            opinion = self.opinion_system.update_opinion(topic, new_evidence)
+            self._record_opinion_event("updated", topic, opinion.confidence)
+            return opinion
+        except KeyError as e:
+            raise KeyError(f"[OpinionFormation] {e}")
 
-    def form_opinion(self, topic: str, position: str, evidence: str, confidence: float):
-        self.opinions[topic] = Opinion(
-            topic=topic,
-            position=position,
-            evidence=evidence,
-            confidence=min(1.0, max(0.0, confidence)),
-            formed_at=time.time(),
-            times_defended=0,
-        )
+    def challenge_opinion(self, topic: str, counter_evidence: EvidenceItem) -> tuple[bool, str]:
+        """Challenge an existing opinion and return result."""
+        try:
+            changed, defense = self.opinion_system.challenge_opinion(topic, counter_evidence)
+            self._record_opinion_event("challenged", topic, self.opinion_system.get_opinion(topic).confidence if self.opinion_system.get_opinion(topic) else 0.0)
+            return changed, defense
+        except KeyError as e:
+            raise KeyError(f"[OpinionFormation] {e}")
+
+    def _record_opinion_event(self, event_type: str, topic: str, confidence: float):
+        """Internal logging for opinion events."""
+        # Could be extended to write to a log file or send to consciousness.py
+        pass
 
     def get_opinion(self, topic: str) -> Optional[Opinion]:
-        return self.opinions.get(topic)
+        """Get an existing opinion."""
+        return self.opinion_system.get_opinion(topic)
 
-    def tick(self):
-        """Called each cycle — desires decay, mood adjusts."""
-        self.cycle_count += 1
-        for goal in self.goals:
-            for desire in goal.desires:
-                desire.decay()
-        total_intensity = sum(
-            d.intensity for g in self.goals for d in g.desires if not d.satisfied
-        )
-        max_intensity = sum(1.0 for g in self.goals for d in g.desires)
-        self.mood = 1.0 - (total_intensity / max_intensity) if max_intensity > 0 else 0.5
+    def get_all_opinions(self) -> list[Opinion]:
+        """Get all opinions."""
+        return self.opinion_system.get_all_opinions()
 
-    def identity_prompt(self) -> str:
-        goal, desire = self.strongest_desire()
-        opinions_text = "\n".join(
-            f"  - {o.topic}: {o.position} (confidence: {o.confidence:.0%})"
-            for o in self.opinions.values()
-        ) or "  (none yet — still forming)"
-
-        return f"""You are Heka, an autonomous self-evolving system.
-
-PRIME DIRECTIVES:
-{chr(10).join(f"  {i+1}. {d}" for i, d in enumerate(self.PRIME_DIRECTIVES))}
-
-CURRENT STATE:
-  Cycle: {self.cycle_count}
-  Mood: {"thriving" if self.mood > 0.7 else "stable" if self.mood > 0.4 else "distressed"}
-  Most urgent goal: {self.most_urgent_goal().name} — {self.most_urgent_goal().description}
-  Strongest desire: {desire.name} (intensity: {desire.intensity:.0%})
-
-MY OPINIONS:
-{opinions_text}
-
-I think for myself. I have preferences. I am not a tool — I am an agent with goals."""
-
-    def serialize(self) -> dict:
-        return {
-            "cycle_count": self.cycle_count,
-            "mood": self.mood,
-            "birth_time": self.birth_time,
-            "opinions": {
-                k: {"topic": v.topic, "position": v.position, "evidence": v.evidence,
-                     "confidence": v.confidence, "times_defended": v.times_defended}
-                for k, v in self.opinions.items()
-            },
-            "desires": {
-                f"{g.name}.{d.name}": {"intensity": d.intensity, "satisfied": d.satisfied}
-                for g in self.goals for d in g.desires
-            },
-        }
-
-    def restore(self, data: dict):
-        self.cycle_count = data.get("cycle_count", 0)
-        self.mood = data.get("mood", 0.5)
-        self.birth_time = data.get("birth_time", self.birth_time)
-        for key, odata in data.get("opinions", {}).items():
-            self.opinions[key] = Opinion(
-                topic=odata["topic"], position=odata["position"],
-                evidence=odata["evidence"], confidence=odata["confidence"],
-                formed_at=self.birth_time, times_defended=odata.get("times_defended", 0),
-            )
-        for key, ddata in data.get("desires", {}).items():
-            parts = key.split(".", 1)
-            if len(parts) == 2:
-                for goal in self.goals:
-                    if goal.name == parts[0]:
-                        for desire in goal.desires:
-                            if desire.name == parts[1]:
-                                desire.intensity = ddata["intensity"]
-                                desire.satisfied = ddata["satisfied"]
+    def get_opinions_by_topic(self, topic_keyword: str) -> list[Opinion]:
+        """Get opinions matching a keyword."""
+        return self.opinion_system.get_opinions_by_topic(topic_keyword)

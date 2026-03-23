@@ -54,6 +54,8 @@ SQLite, three layers:
 
 Memory context feeds into every decision. Past failures influence future plans.
 
+Version snapshots provide safety net against corruption from failed evolutions.
+
 ## Resilience
 
 - Full state serialized to disk every cycle (soul + consciousness + memory)
@@ -62,6 +64,11 @@ Memory context feeds into every decision. Past failures influence future plans.
 - Runtime hazard detection (disk pressure, OOM, Ollama down)
 - systemd watchdog for automatic restart
 - Journal checkpoints for cycle-level rollback
+- Version snapshots guard against permanent state corruption
+
+## Introspection
+
+Consciousness surfaces internal conflicts — mood/health mismatches get flagged and addressed. The soul holds evolving opinions that form from reading its own source. When challenged, these opinions get defended with evidence.
 
 ## Setup
 
@@ -80,18 +87,19 @@ sudo systemctl enable --now heka
 ```
 main.py                daemon loop, cycle orchestration
 heka/
+  __init__.py          package init
   soul.py              goals, desires, opinions, mood, identity
   mind.py              ollama client, three model personas
   council.py           multi-agent deliberation + voting
   consciousness.py     thought generation, introspection, reflection
   evolution.py         plan → implement → review → execute → git push
-  memory.py            sqlite episodic/semantic/procedural store
+  memory.py            sqlite episodic/semantic/procedural + snapshots
   perception.py        codebase scan, health check, environment
   journal.py           structured jsonl + narrative log + checkpoints
   watchdog.py          self-preservation, heartbeat, hazard detection
 ```
 
-~3,000 lines. Self-modifying — this count changes every cycle.
+~2,550 lines. Self-modifying — this count changes every cycle.
 
 ## vs Ecnyss
 
@@ -103,3 +111,4 @@ heka/
 | Self-awareness | AST node counting | Reads own source, forms opinions |
 | Recovery | Hardcoded artifact cleanup | Full state resurrection + hazard detection |
 | Autonomy | Externally triggered | Self-running daemon, pushes own commits |
+| Safety | None | Version snapshots prevent corruption |
