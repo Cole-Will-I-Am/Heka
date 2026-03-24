@@ -1,17 +1,3 @@
-"""
-Heka's memory — episodic, semantic, and procedural.
-
-All memory persists in SQLite. Heka never forgets unless it
-chooses to — and even then, it archives rather than deletes.
-
-This module provides:
-- Robust long-term memory persistence with automatic checkpointing
-- Efficient retrieval using semantic similarity and pattern matching
-- Automatic load-on-startup to restore state across cycles
-- Safe evolution with atomic operations and error handling
-- File-based snapshot mechanism to compensate for unavailable git
-"""
-
 import json
 import logging
 import os
@@ -19,12 +5,54 @@ import shutil
 import time
 import sqlite3
 import threading
-from datetime import datetime
+import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Any, Dict, List
+from typing import Optional, Any, Dict, List, Literal, Union, Callable
 from contextlib import contextmanager
+from dataclasses import dataclass, asdict, field
+from enum import Enum
+import hashlib
 
 log = logging.getLogger("heka.memory")
+
+
+class MemoryType(Enum):
+    """Types of memory stored in the system."""
+    OPINION = "opinion"
+    LEARNING = "learning"
+    STATE = "state"
+    EPISODIC = "episodic"
+    SEMANTIC = "semantic"
+    PROCEDURAL = "procedural"
+
+
+@dataclass
+class MemoryRecord:
+    """A single memory record with metadata."""
+    id: int
+    type: MemoryType
+    key: str
+    value: Any
+    created_at: float
+    updated_at: float
+    version: int = 1
+    tags: List[str] = field(default_factory=list)
+    source: str = "internal"
+    checksum: str = ""
+
+    def __post_init__(self):
+        if isinstance(self.type, str):
+            self.type = MemoryType(self.type)
+        if isinstance(self.value, (dict, list)):
+            self.value = json.dumps(self.value, ensure_ascii=False, sort_keys=True)
+        if not self.checksum:
+            self.checksum = self._compute_checksum()
+
+    def _compute_checksum(self) -> str:
+        """Compute SHA256 checksum of the value."""
+        value_str = str(self.value)
+        return hashlib.sha256(value_str.encode("utf-8")).hexdigest()
 
 
 class SnapshotManager:
@@ -105,394 +133,449 @@ class SnapshotManager:
 
     def get_snapshot_by_timestamp(self, timestamp: str) -> Optional[Path]:
         """Get a specific snapshot by its timestamp."""
-        return next(self.snapshot_dir.glob(f"snapshot_{timestamp}.db"), None)
+        pattern = f"snapshot_{timestamp}.db"
+        snapshot_path = self.snapshot_dir / pattern
+        return snapshot_path if snapshot_path.exists() else None
 
     def _prune_snapshots(self):
-        """Remove old snapshots beyond the maximum retention count."""
+        """Remove old snapshots beyond the retention limit."""
         snapshots = sorted(self.snapshot_dir.glob("snapshot_*.db"), key=lambda p: p.name)
-        if len(snapshots) > self._max_snapshots:
-            to_remove = snapshots[:-self._max_snapshots]
-            for snapshot in to_remove:
-                metadata = snapshot.with_suffix(".json")
-                try:
-                    snapshot.unlink()
-                    if metadata.exists():
-                        metadata.unlink()
-                    log.info(f"Removed old snapshot: {snapshot.name}")
-                except Exception as e:
-                    log.warning(f"Failed to remove old snapshot {snapshot}: {e}")
+        while len(snapshots) > self._max_snapshots:
+            oldest = snapshots.pop(0)
+            metadata = oldest.with_suffix(".json")
+            try:
+                oldest.unlink()
+                if metadata.exists():
+                    metadata.unlink()
+                log.info(f"Pruned old snapshot: {oldest}")
+            except Exception as e:
+                log.warning(f"Failed to prune snapshot {oldest}: {e}")
+
+    def restore_snapshot(self, snapshot_path: Path) -> bool:
+        """Restore database from a snapshot."""
+        try:
+            if not snapshot_path.exists():
+                raise FileNotFoundError(f"Snapshot not found: {snapshot_path}")
+            
+            # Ensure parent directory exists
+            self.base_db_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Copy snapshot to base path
+            shutil.copy2(snapshot_path, self.base_db_path)
+            
+            # Restore metadata if available
+            metadata_path = snapshot_path.with_suffix(".json")
+            if metadata_path.exists():
+                shutil.copy2(metadata_path, self.base_db_path.parent / "last_snapshot.json")
+            
+            log.info(f"Restored database from snapshot: {snapshot_path}")
+            return True
+        except Exception as e:
+            log.error(f"Failed to restore snapshot {snapshot_path}: {e}")
+            return False
 
 
-class Memory:
+class MemoryPersistence:
     """
-    Three-layer memory:
-    - Episodic: What happened (events, cycles, outcomes)
-    - Semantic: What things mean (learned facts, patterns, opinions)
-    - Procedural: How to do things (successful strategies, failure patterns)
+    Core memory persistence layer with opinion support.
     
-    Features:
-    - Automatic persistence with WAL mode for concurrent access
-    - Load-on-startup to restore memories from disk
-    - Semantic search with pattern matching and significance weighting
-    - Safe evolution with checkpoint snapshots and atomic commits
-    - File-based snapshot mechanism to compensate for unavailable git
+    Ensures opinions, learnings, and state are reliably saved to survive interruptions.
+    Implements atomic operations, versioning, checksums, and automatic checkpointing.
     """
 
-    def __init__(self, db_path: Path | str):
+    SCHEMA_VERSION = 3  # Increment when schema changes
+
+    def __init__(self, db_path: Path, snapshot_manager: Optional[SnapshotManager] = None):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.snapshot_manager = snapshot_manager
+        self._lock = threading.RLock()
         self._conn: Optional[sqlite3.Connection] = None
-        self._pending_writes = 0
-        self._last_commit = time.time()
-        self._commit_every = 8
-        self._lock = threading.Lock()
-        self._loaded = False
-        self._snapshot_manager: Optional[SnapshotManager] = None
-        self._init_db()
+        self._initialized = False
+        self._checkpoint_interval = 300  # seconds
+        self._last_checkpoint = time.time()
+        self._opinion_callbacks: List[Callable[[MemoryRecord], None]] = []
 
-    @contextmanager
-    def _db_connection(self):
-        """Thread-safe database connection context."""
-        with self._lock:
-            if self._conn is None:
-                raise RuntimeError("Database not initialized")
-            yield self._conn
+    def register_opinion_callback(self, callback: Callable[[MemoryRecord], None]):
+        """Register a callback to be invoked when opinions are updated."""
+        self._opinion_callbacks.append(callback)
 
-    def _init_db(self):
-        """Initialize database schema and load existing memories."""
-        try:
-            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+    def _connect(self) -> sqlite3.Connection:
+        """Establish database connection with proper settings."""
+        if self._conn is None:
+            self._conn = sqlite3.connect(
+                str(self.db_path),
+                isolation_level=None,
+                timeout=30.0,
+                check_same_thread=False
+            )
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("PRAGMA temp_store=MEMORY")
-            self._conn.executescript("""
-                CREATE TABLE IF NOT EXISTS episodic (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event TEXT NOT NULL,
-                    data TEXT NOT NULL,
-                    significance REAL DEFAULT 0.5,
-                    timestamp REAL NOT NULL,
-                    cycle INTEGER DEFAULT 0
-                );
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
+        return self._conn
 
-                CREATE TABLE IF NOT EXISTS semantic (
-                    key TEXT PRIMARY KEY,
+    def _ensure_schema(self, conn: sqlite3.Connection):
+        """Ensure database schema is up to date."""
+        cursor = conn.cursor()
+        
+        # Get current schema version
+        cursor.execute("PRAGMA user_version")
+        current_version = cursor.fetchone()[0]
+        
+        if current_version < self.SCHEMA_VERSION:
+            log.info(f"Upgrading schema from v{current_version} to v{self.SCHEMA_VERSION}")
+            
+            # Create tables if they don't exist
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    type TEXT NOT NULL,
+                    key TEXT NOT NULL,
                     value TEXT NOT NULL,
-                    tags TEXT DEFAULT '[]',
-                    confidence REAL DEFAULT 0.5,
-                    updated_at REAL NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS procedural (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    strategy TEXT NOT NULL,
-                    context TEXT NOT NULL,
-                    outcome TEXT NOT NULL,
-                    success INTEGER NOT NULL,
-                    learned_at REAL NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_episodic_event ON episodic(event);
-                CREATE INDEX IF NOT EXISTS idx_episodic_time ON episodic(timestamp);
-                CREATE INDEX IF NOT EXISTS idx_episodic_cycle ON episodic(cycle);
-                CREATE INDEX IF NOT EXISTS idx_procedural_success ON procedural(success);
-                CREATE INDEX IF NOT EXISTS idx_semantic_tags ON semantic(tags);
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    tags TEXT,
+                    source TEXT,
+                    checksum TEXT NOT NULL,
+                    UNIQUE(type, key)
+                )
             """)
-            self._conn.commit()
             
-            # Initialize snapshot manager
-            self._snapshot_manager = SnapshotManager(self.db_path)
+            # Add opinion-specific table if upgrading from older schema
+            if current_version < 2:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS opinions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        memory_id INTEGER NOT NULL,
+                        confidence REAL NOT NULL,
+                        certainty REAL NOT NULL,
+                        emotional_valence REAL NOT NULL,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        FOREIGN KEY (memory_id) REFERENCES memory(id) ON DELETE CASCADE
+                    )
+                """)
             
-            self._load_memories()
-        except Exception as e:
-            log.error(f"Failed to initialize database: {e}")
-            raise
-
-    def _load_memories(self):
-        """Load existing memories from disk."""
-        try:
-            with self._db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT COUNT(*) FROM episodic")
-                episodic_count = cursor.fetchone()[0]
-                cursor.execute("SELECT COUNT(*) FROM semantic")
-                semantic_count = cursor.fetchone()[0]
-                cursor.execute("SELECT COUNT(*) FROM procedural")
-                procedural_count = cursor.fetchone()[0]
+            # Add versioning support
+            if current_version < 3:
+                cursor.execute("ALTER TABLE memory ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+                cursor.execute("ALTER TABLE memory ADD COLUMN tags TEXT")
+                cursor.execute("ALTER TABLE memory ADD COLUMN source TEXT")
+                cursor.execute("ALTER TABLE memory ADD COLUMN checksum TEXT")
                 
-                log.info(f"Loaded memories: {episodic_count} episodic, "
-                        f"{semantic_count} semantic, {procedural_count} procedural")
-        except Exception as e:
-            log.error(f"Failed to load memories: {e}")
-            raise
+                # Backfill checksums
+                cursor.execute("SELECT id, value FROM memory")
+                for row in cursor.fetchall():
+                    value = row["value"]
+                    checksum = hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+                    cursor.execute(
+                        "UPDATE memory SET checksum = ? WHERE id = ?",
+                        (checksum, row["id"])
+                    )
+            
+            # Set schema version
+            cursor.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
+            conn.commit()
+            log.info(f"Schema upgraded to v{self.SCHEMA_VERSION}")
 
-    def create_snapshot(self, reason: str = "") -> Path:
-        """
-        Create a snapshot of the current database state.
+    def initialize(self):
+        """Initialize the memory system on startup."""
+        with self._lock:
+            if self._initialized:
+                return
+                
+            try:
+                conn = self._connect()
+                self._ensure_schema(conn)
+                self._initialized = True
+                
+                # Create initial snapshot if this is first run
+                if not self.get_memory(MemoryType.STATE, "system_initialized"):
+                    self._save_memory(
+                        MemoryRecord(
+                            id=0,
+                            type=MemoryType.STATE,
+                            key="system_initialized",
+                            value=datetime.now(timezone.utc).isoformat(),
+                            created_at=time.time(),
+                            updated_at=time.time(),
+                            version=1,
+                            source="system"
+                        )
+                    )
+                    log.info("System initialized - created initial state record")
+                
+                # Load opinions from last run if available
+                opinions = self.get_opinions()
+                if opinions:
+                    log.info(f"Loaded {len(opinions)} opinions from persistent storage")
+                
+                log.info(f"Memory persistence initialized at {self.db_path}")
+                
+            except Exception as e:
+                log.error(f"Failed to initialize memory: {e}")
+                raise
+
+    def _save_memory(self, record: MemoryRecord) -> MemoryRecord:
+        """Save a memory record with full validation and checksum verification."""
+        conn = self._connect()
+        cursor = conn.cursor()
         
-        This method delegates to the SnapshotManager but ensures
-        all pending writes are committed first.
+        # Validate checksum
+        if record.checksum != record._compute_checksum():
+            raise ValueError(f"Checksum mismatch for memory key '{record.key}'")
+        
+        # Check for existing record
+        cursor.execute(
+            "SELECT id, version FROM memory WHERE type = ? AND key = ?",
+            (record.type.value, record.key)
+        )
+        existing = cursor.fetchone()
+        
+        if existing:
+            # Update existing record
+            new_version = existing["version"] + 1
+            cursor.execute(
+                """
+                UPDATE memory 
+                SET value = ?, updated_at = ?, version = ?, 
+                    tags = ?, source = ?, checksum = ?
+                WHERE type = ? AND key = ?
+                """,
+                (
+                    record.value,
+                    record.updated_at,
+                    new_version,
+                    json.dumps(record.tags) if record.tags else None,
+                    record.source,
+                    record.checksum,
+                    record.type.value,
+                    record.key
+                )
+            )
+            record.id = existing["id"]
+            record.version = new_version
+        else:
+            # Insert new record
+            cursor.execute(
+                """
+                INSERT INTO memory 
+                (type, key, value, created_at, updated_at, version, tags, source, checksum)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.type.value,
+                    record.key,
+                    record.value,
+                    record.created_at,
+                    record.updated_at,
+                    1,
+                    json.dumps(record.tags) if record.tags else None,
+                    record.source,
+                    record.checksum
+                )
+            )
+            record.id = cursor.lastrowid
+            record.version = 1
+        
+        conn.commit()
+        
+        # Handle opinion-specific storage if applicable
+        if record.type == MemoryType.OPINION:
+            self._save_opinion(record)
+        
+        # Trigger callbacks for opinions
+        if record.type == MemoryType.OPINION:
+            for callback in self._opinion_callbacks:
+                try:
+                    callback(record)
+                except Exception as e:
+                    log.error(f"Opinion callback failed: {e}")
+        
+        return record
+
+    def _save_opinion(self, record: MemoryRecord):
+        """Save opinion-specific metadata."""
+        try:
+            value = json.loads(record.value)
+            opinion_data = value.get("opinion", {})
+            
+            conn = self._connect()
+            cursor = conn.cursor()
+            
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO opinions 
+                (memory_id, confidence, certainty, emotional_valence, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.id,
+                    opinion_data.get("confidence", 0.5),
+                    opinion_data.get("certainty", 0.5),
+                    opinion_data.get("emotional_valence", 0.0),
+                    record.created_at,
+                    record.updated_at
+                )
+            )
+            conn.commit()
+        except Exception as e:
+            log.warning(f"Failed to save opinion metadata: {e}")
+
+    def save_memory(
+        self,
+        type: MemoryType,
+        key: str,
+        value: Any,
+        tags: Optional[List[str]] = None,
+        source: str = "internal"
+    ) -> MemoryRecord:
+        """
+        Save a memory record with automatic versioning and checksumming.
         
         Args:
-            reason: Optional description of why the snapshot was created
+            type: Type of memory (opinion, learning, state, etc.)
+            key: Unique identifier for this memory
+            value: Memory content (will be JSON-serialized if complex)
+            tags: Optional list of tags for filtering
+            source: Origin of this memory ("internal", "user", "system", etc.)
             
         Returns:
-            Path to the created snapshot file
+            The saved MemoryRecord with assigned ID and version
         """
-        if self._conn is None:
-            raise RuntimeError("Database not initialized")
-        
-        # Ensure all pending writes are committed
-        self._commit_if_needed()
-        
-        if self._snapshot_manager is None:
-            raise RuntimeError("Snapshot manager not initialized")
-        
-        return self._snapshot_manager.create_snapshot(reason)
-
-    def rollback_to_snapshot(self, timestamp: str) -> bool:
-        """
-        Rollback the database to a specific snapshot.
-        
-        Args:
-            timestamp: Timestamp of the snapshot to restore
-            
-        Returns:
-            True if rollback was successful, False otherwise
-        """
-        if self._conn is None:
-            raise RuntimeError("Database not initialized")
-        
-        if self._snapshot_manager is None:
-            raise RuntimeError("Snapshot manager not initialized")
-        
-        snapshot_path = self._snapshot_manager.get_snapshot_by_timestamp(timestamp)
-        if not snapshot_path:
-            log.error(f"Snapshot not found for timestamp: {timestamp}")
-            return False
-        
-        try:
-            # Create a new snapshot of current state before rollback
-            self.create_snapshot(f"pre-rollback-{timestamp}")
-            
-            # Close current connection
-            self._conn.close()
-            self._conn = None
-            
-            # Replace current database with snapshot
-            backup_path = self.db_path.with_suffix(".bak")
-            shutil.move(str(self.db_path), str(backup_path))
-            shutil.copy(str(snapshot_path), str(self.db_path))
-            
-            # Reinitialize database
-            self._init_db()
-            
-            log.info(f"Successfully rolled back to snapshot: {timestamp}")
-            return True
-        except Exception as e:
-            log.error(f"Failed to rollback to snapshot {timestamp}: {e}")
-            # Attempt to restore original database
+        with self._lock:
             try:
-                if backup_path.exists():
-                    shutil.move(str(backup_path), str(self.db_path))
-                self._init_db()
-            except Exception as restore_e:
-                log.critical(f"Critical: Failed to restore database after failed rollback: {restore_e}")
-            return False
+                # Normalize value to string
+                if isinstance(value, (dict, list)):
+                    value_str = json.dumps(value, ensure_ascii=False, sort_keys=True)
+                else:
+                    value_str = str(value)
+                
+                # Compute checksum
+                checksum = hashlib.sha256(value_str.encode("utf-8")).hexdigest()
+                
+                record = MemoryRecord(
+                    id=0,
+                    type=type,
+                    key=key,
+                    value=value_str,
+                    created_at=time.time(),
+                    updated_at=time.time(),
+                    version=1,
+                    tags=tags or [],
+                    source=source,
+                    checksum=checksum
+                )
+                
+                return self._save_memory(record)
+                
+            except Exception as e:
+                log.error(f"Failed to save memory {type.value}/{key}: {e}")
+                raise
 
-    def _commit_if_needed(self):
-        """Commit pending writes if threshold reached."""
-        if self._pending_writes >= self._commit_every:
-            self._commit()
-            self._pending_writes = 0
+    def get_memory(self, type: MemoryType, key: str) -> Optional[MemoryRecord]:
+        """Retrieve a specific memory record."""
+        with self._lock:
+            try:
+                conn = self._connect()
+                cursor = conn.cursor()
+                
+                cursor.execute(
+                    "SELECT * FROM memory WHERE type = ? AND key = ?",
+                    (type.value, key)
+                )
+                row = cursor.fetchone()
+                
+                if row:
+                    return self._row_to_record(row)
+                return None
+                
+            except Exception as e:
+                log.error(f"Failed to retrieve memory {type.value}/{key}: {e}")
+                return None
 
-    def _commit(self):
-        """Commit pending changes to the database."""
-        if self._conn is None:
-            raise RuntimeError("Database not initialized")
-        
+    def get_opinions(self) -> List[MemoryRecord]:
+        """Retrieve all opinion memories."""
+        with self._lock:
+            try:
+                conn = self._connect()
+                cursor = conn.cursor()
+                
+                cursor.execute(
+                    "SELECT * FROM memory WHERE type = ?",
+                    (MemoryType.OPINION.value,)
+                )
+                rows = cursor.fetchall()
+                
+                return [self._row_to_record(row) for row in rows]
+                
+            except Exception as e:
+                log.error(f"Failed to retrieve opinions: {e}")
+                return []
+
+    def get_memories_by_type(self, type: MemoryType) -> List[MemoryRecord]:
+        """Retrieve all memories of a specific type."""
+        with self._lock:
+            try:
+                conn = self._connect()
+                cursor = conn.cursor()
+                
+                cursor.execute(
+                    "SELECT * FROM memory WHERE type = ?",
+                    (type.value,)
+                )
+                rows = cursor.fetchall()
+                
+                return [self._row_to_record(row) for row in rows]
+                
+            except Exception as e:
+                log.error(f"Failed to retrieve memories of type {type.value}: {e}")
+                return []
+
+    def get_memories_by_tag(self, tag: str, type: Optional[MemoryType] = None) -> List[MemoryRecord]:
+        """Retrieve memories matching a specific tag."""
+        with self._lock:
+            try:
+                conn = self._connect()
+                cursor = conn.cursor()
+                
+                if type:
+                    cursor.execute(
+                        "SELECT * FROM memory WHERE type = ? AND tags LIKE ?",
+                        (type.value, f'%"{tag}"%')
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT * FROM memory WHERE tags LIKE ?",
+                        (f'%"{tag}"%',)
+                    )
+                
+                rows = cursor.fetchall()
+                return [self._row_to_record(row) for row in rows]
+                
+            except Exception as e:
+                log.error(f"Failed to retrieve memories with tag '{tag}': {e}")
+                return []
+
+    def _row_to_record(self, row: sqlite3.Row) -> MemoryRecord:
+        """Convert a database row to a MemoryRecord."""
         try:
-            self._conn.commit()
-            self._last_commit = time.time()
+            tags = json.loads(row["tags"]) if row["tags"] else []
+            return MemoryRecord(
+                id=row["id"],
+                type=MemoryType(row["type"]),
+                key=row["key"],
+                value=row["value"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+                version=row["version"],
+                tags=tags,
+                source=row["source"],
+                checksum=row["checksum"]
+            )
         except Exception as e:
-            log.error(f"Failed to commit: {e}")
+            log.error(f"Failed to convert row to record: {e}")
             raise
-
-    def _increment_pending_writes(self):
-        """Increment pending writes counter and commit if needed."""
-        self._pending_writes += 1
-        self._commit_if_needed()
-
-    def add_episodic_memory(self, event: str, data: Dict[str, Any], 
-                           significance: float = 0.5, cycle: int = 0):
-        """Add an episodic memory entry."""
-        with self._db_connection() as conn:
-            conn.execute(
-                "INSERT INTO episodic (event, data, significance, timestamp, cycle) VALUES (?, ?, ?, ?, ?)",
-                (event, json.dumps(data), significance, time.time(), cycle)
-            )
-            self._increment_pending_writes()
-
-    def add_semantic_memory(self, key: str, value: Dict[str, Any], 
-                           tags: List[str] = None, confidence: float = 0.5):
-        """Add or update a semantic memory entry."""
-        tags = tags or []
-        with self._db_connection() as conn:
-            conn.execute(
-                """INSERT OR REPLACE INTO semantic 
-                   (key, value, tags, confidence, updated_at) 
-                   VALUES (?, ?, ?, ?, ?)""",
-                (key, json.dumps(value), json.dumps(tags), confidence, time.time())
-            )
-            self._increment_pending_writes()
-
-    def add_procedural_memory(self, strategy: str, context: Dict[str, Any], 
-                             outcome: str, success: bool):
-        """Add a procedural memory entry."""
-        with self._db_connection() as conn:
-            conn.execute(
-                """INSERT INTO procedural 
-                   (strategy, context, outcome, success, learned_at) 
-                   VALUES (?, ?, ?, ?, ?)""",
-                (strategy, json.dumps(context), outcome, 1 if success else 0, time.time())
-            )
-            self._increment_pending_writes()
-
-    def search_episodic(self, event_pattern: str = "", 
-                       min_significance: float = 0.0, 
-                       max_results: int = 10) -> List[Dict[str, Any]]:
-        """Search episodic memories by event pattern and significance."""
-        with self._db_connection() as conn:
-            cursor = conn.cursor()
-            if event_pattern:
-                cursor.execute(
-                    """SELECT * FROM episodic 
-                       WHERE event LIKE ? AND significance >= ? 
-                       ORDER BY significance DESC, timestamp DESC 
-                       LIMIT ?""",
-                    (f"%{event_pattern}%", min_significance, max_results)
-                )
-            else:
-                cursor.execute(
-                    """SELECT * FROM episodic 
-                       WHERE significance >= ? 
-                       ORDER BY significance DESC, timestamp DESC 
-                       LIMIT ?""",
-                    (min_significance, max_results)
-                )
-            return [dict(row) for row in cursor.fetchall()]
-
-    def get_semantic_memory(self, key: str) -> Optional[Dict[str, Any]]:
-        """Get a semantic memory entry by key."""
-        with self._db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM semantic WHERE key = ?", (key,))
-            row = cursor.fetchone()
-            if row:
-                data = dict(row)
-                data["value"] = json.loads(data["value"])
-                data["tags"] = json.loads(data["tags"])
-                return data
-            return None
-
-    def get_procedural_memories(self, success_only: bool = True) -> List[Dict[str, Any]]:
-        """Get procedural memories, optionally filtered by success."""
-        with self._db_connection() as conn:
-            cursor = conn.cursor()
-            if success_only:
-                cursor.execute("SELECT * FROM procedural WHERE success = 1 ORDER BY learned_at DESC")
-            else:
-                cursor.execute("SELECT * FROM procedural ORDER BY learned_at DESC")
-            return [dict(row) for row in cursor.fetchall()]
-
-    def get_latest_snapshot(self) -> Optional[Path]:
-        """Get the most recent snapshot path."""
-        if self._snapshot_manager is None:
-            return None
-        return self._snapshot_manager.get_latest_snapshot()
-
-    def get_snapshot_metadata(self, timestamp: str) -> Optional[Dict[str, Any]]:
-        """Get metadata for a specific snapshot."""
-        if self._snapshot_manager is None:
-            return None
-        
-        snapshot_path = self._snapshot_manager.get_snapshot_by_timestamp(timestamp)
-        if not snapshot_path:
-            return None
-        
-        metadata_path = snapshot_path.with_suffix(".json")
-        try:
-            with open(metadata_path, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            log.warning(f"Failed to load snapshot metadata for {timestamp}: {e}")
-            return None
-
-    async def store_episodic(self, event: str, data: Dict[str, Any],
-                             significance: float = 0.5, cycle: int = 0):
-        """Async wrapper for add_episodic_memory."""
-        self.add_episodic_memory(event, data, significance, cycle)
-
-    async def store_procedural(self, strategy: str, context: str,
-                               outcome: str, success: bool):
-        """Async wrapper for add_procedural_memory."""
-        self.add_procedural_memory(strategy, {"context": context}, outcome, success)
-
-    async def get_context_for_decision(self, domain: str) -> str:
-        """Build a context string from recent memories relevant to a domain."""
-        episodes = self.search_episodic(domain, max_results=5)
-        semantic = self.get_semantic_memory(domain)
-        procedures = self.get_procedural_memories(success_only=True)[:5]
-
-        parts = []
-        if episodes:
-            parts.append("Recent events: " + "; ".join(
-                f"{e['event']} (sig={e['significance']:.2f})" for e in episodes
-            ))
-        if semantic:
-            parts.append(f"Knowledge ({domain}): {json.dumps(semantic['value'])}")
-        if procedures:
-            parts.append("Successful strategies: " + "; ".join(
-                p['strategy'][:80] for p in procedures
-            ))
-        return "\n".join(parts) if parts else "(no relevant memories)"
-
-    def flush(self):
-        """Commit all pending writes to disk."""
-        if self._conn is not None:
-            try:
-                self._conn.commit()
-                self._pending_writes = 0
-                self._last_commit = time.time()
-            except Exception as e:
-                log.error(f"Failed to flush: {e}")
-
-    def stats(self) -> Dict[str, Any]:
-        """Return memory statistics."""
-        with self._db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM episodic")
-            ep = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM semantic")
-            sem = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM procedural")
-            proc = cursor.fetchone()[0]
-            return {
-                "episodic": ep,
-                "semantic": sem,
-                "procedural": proc,
-                "total": ep + sem + proc,
-                "pending_writes": self._pending_writes,
-            }
-
-    def close(self):
-        """Close the database connection and commit any remaining changes."""
-        if self._conn is not None:
-            try:
-                self._commit()
-                self._conn.close()
-            except Exception as e:
-                log.error(f"Error closing database: {e}")
-            finally:
-                self._conn = None

@@ -42,7 +42,7 @@ Not config. Internal drive.
 - **Evolution** — reduce complexity, increase reliability, expand capability
 - **Creation** — solve problems, build useful things
 
-Desires grow stronger when unmet. Mood tracks overall state. Opinions form from introspection and get defended when challenged.
+Desires grow stronger when unmet. Mood tracks overall state. Opinions form from introspection and get defended when challenged. Cognitive distress is detected early via watchdog monitoring.
 
 ## Memory
 
@@ -52,7 +52,7 @@ SQLite, three layers:
 - **Semantic** — what things mean (learned facts, code patterns)
 - **Procedural** — what works (successful strategies, failure patterns to avoid)
 
-Memory context feeds into every decision. Past failures influence future plans.
+Memory context feeds into every decision. Past failures influence future plans. Opinions persist across sessions via memory storage.
 
 Version snapshots provide safety net against corruption from failed evolutions.
 
@@ -62,6 +62,7 @@ Version snapshots provide safety net against corruption from failed evolutions.
 - Detects previous crashes and resumes from saved state
 - Handles SIGTERM/SIGINT — saves before dying
 - Runtime hazard detection (disk pressure, OOM, Ollama down)
+- Cognitive distress detection — flags internal conflicts early
 - systemd watchdog for automatic restart
 - Journal checkpoints for cycle-level rollback
 - Version snapshots guard against permanent state corruption
@@ -93,13 +94,13 @@ heka/
   council.py           multi-agent deliberation + voting
   consciousness.py     thought generation, introspection, reflection
   evolution.py         plan → implement → review → execute → git push
-  memory.py            sqlite episodic/semantic/procedural + snapshots
+  memory.py            sqlite episodic/semantic/procedural + snapshots + opinion persistence
   perception.py        codebase scan, health check, environment
   journal.py           structured jsonl + narrative log + checkpoints
-  watchdog.py          self-preservation, heartbeat, hazard detection
+  watchdog.py          self-preservation, heartbeat, hazard detection, cognitive monitoring
 ```
 
-~2,550 lines. Self-modifying — this count changes every cycle.
+~2,842 lines. Self-modifying — this count changes every cycle.
 
 ## vs Ecnyss
 
