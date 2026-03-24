@@ -429,6 +429,63 @@ class Memory:
             log.warning(f"Failed to load snapshot metadata for {timestamp}: {e}")
             return None
 
+    async def store_episodic(self, event: str, data: Dict[str, Any],
+                             significance: float = 0.5, cycle: int = 0):
+        """Async wrapper for add_episodic_memory."""
+        self.add_episodic_memory(event, data, significance, cycle)
+
+    async def store_procedural(self, strategy: str, context: str,
+                               outcome: str, success: bool):
+        """Async wrapper for add_procedural_memory."""
+        self.add_procedural_memory(strategy, {"context": context}, outcome, success)
+
+    async def get_context_for_decision(self, domain: str) -> str:
+        """Build a context string from recent memories relevant to a domain."""
+        episodes = self.search_episodic(domain, max_results=5)
+        semantic = self.get_semantic_memory(domain)
+        procedures = self.get_procedural_memories(success_only=True)[:5]
+
+        parts = []
+        if episodes:
+            parts.append("Recent events: " + "; ".join(
+                f"{e['event']} (sig={e['significance']:.2f})" for e in episodes
+            ))
+        if semantic:
+            parts.append(f"Knowledge ({domain}): {json.dumps(semantic['value'])}")
+        if procedures:
+            parts.append("Successful strategies: " + "; ".join(
+                p['strategy'][:80] for p in procedures
+            ))
+        return "\n".join(parts) if parts else "(no relevant memories)"
+
+    def flush(self):
+        """Commit all pending writes to disk."""
+        if self._conn is not None:
+            try:
+                self._conn.commit()
+                self._pending_writes = 0
+                self._last_commit = time.time()
+            except Exception as e:
+                log.error(f"Failed to flush: {e}")
+
+    def stats(self) -> Dict[str, Any]:
+        """Return memory statistics."""
+        with self._db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM episodic")
+            ep = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM semantic")
+            sem = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM procedural")
+            proc = cursor.fetchone()[0]
+            return {
+                "episodic": ep,
+                "semantic": sem,
+                "procedural": proc,
+                "total": ep + sem + proc,
+                "pending_writes": self._pending_writes,
+            }
+
     def close(self):
         """Close the database connection and commit any remaining changes."""
         if self._conn is not None:

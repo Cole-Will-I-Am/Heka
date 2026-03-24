@@ -347,3 +347,84 @@ class Consciousness:
             safe_perception["memory"] = f"[Memory context: {len(safe_perception['memory'])} bytes]"
 
         return json.dumps(safe_perception, indent=2, default=str)
+
+    async def introspect(self, own_source: str):
+        """Deep self-analysis — read own source and reflect on it."""
+        identity = self.soul.identity_prompt()
+        analysis = await self.analyst.think(
+            "Perform deep introspection on your own source code.\n"
+            "Identify: strengths, weaknesses, potential improvements, "
+            "and anything that surprises you.\n"
+            "Be honest and specific.\n\n"
+            'Respond with a JSON array:\n'
+            '[{"content": "...", "category": "insight", "urgency": 0.0-1.0}]',
+            context=f"{identity}\n\nMy source code:\n{own_source[:4000]}",
+            num_predict=1200,
+        )
+        try:
+            text = analysis.content.strip()
+            if text.startswith("```"):
+                lines = text.split("\n")
+                text = "\n".join(lines[1:-1])
+            match = re.search(r"\[.*\]", text, re.DOTALL)
+            if match:
+                parsed = json.loads(match.group())
+                for t in parsed:
+                    self.stream.append(Stream(
+                        content=t.get("content", ""),
+                        category=t.get("category", "insight"),
+                        urgency=float(t.get("urgency", 0.5)),
+                        source="introspection",
+                    ))
+        except (json.JSONDecodeError, ValueError) as e:
+            log.warning(f"Introspection parse failed: {e}")
+
+    async def reflect(self, outcome: dict):
+        """Reflect on an evolution outcome and update mood."""
+        if outcome.get("success"):
+            self.soul.mood = min(1.0, self.soul.mood + 0.1)
+        else:
+            self.soul.mood = max(0.0, self.soul.mood - 0.1)
+
+        self.stream.append(Stream(
+            content=f"Reflecting on {outcome.get('action', 'unknown')}: "
+                    f"{'succeeded' if outcome.get('success') else 'failed'}. "
+                    f"Files: {outcome.get('files', [])}",
+            category="insight",
+            urgency=0.4,
+            source="reflection",
+        ))
+
+    def snapshot(self) -> dict:
+        """Serialize consciousness state for persistence."""
+        return {
+            "stream_length": len(self.stream),
+            "last_introspection": self._last_introspection,
+            "current_mood": {
+                "label": self._current_mood.label,
+                "intensity": self._current_mood.intensity,
+                "confidence": self._current_mood.confidence,
+                "triggers": self._current_mood.triggers,
+            },
+            "recent_thoughts": [
+                {
+                    "content": s.content[:200],
+                    "category": s.category,
+                    "urgency": s.urgency,
+                    "source": s.source,
+                }
+                for s in self.stream[-10:]
+            ],
+        }
+
+    def restore(self, data: dict):
+        """Restore consciousness state from snapshot."""
+        self._last_introspection = data.get("last_introspection", 0)
+        mood_data = data.get("current_mood", {})
+        if mood_data:
+            self._current_mood = MoodState(
+                label=mood_data.get("label", "stable"),
+                intensity=mood_data.get("intensity", 0.0),
+                confidence=mood_data.get("confidence", 0.95),
+                triggers=mood_data.get("triggers", []),
+            )

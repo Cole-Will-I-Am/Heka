@@ -298,3 +298,126 @@ class Soul:
     def get_opinions_by_topic(self, topic_keyword: str) -> list[Opinion]:
         """Get opinions matching a keyword."""
         return self.opinion_system.get_opinions_by_topic(topic_keyword)
+
+    @property
+    def opinions(self) -> dict[str, Opinion]:
+        """Access the opinion system's opinions dict."""
+        return self.opinion_system.opinions
+
+    def strongest_desire(self) -> tuple[Optional[Goal], Optional[Desire]]:
+        """Return the goal and desire with the highest unsatisfied intensity."""
+        best_goal = None
+        best_desire = None
+        best_intensity = -1.0
+        for goal in self.goals:
+            if not goal.active:
+                continue
+            for desire in goal.desires:
+                if not desire.satisfied and desire.intensity > best_intensity:
+                    best_intensity = desire.intensity
+                    best_desire = desire
+                    best_goal = goal
+        return best_goal, best_desire
+
+    def identity_prompt(self) -> str:
+        """Return a system prompt encoding Heka's identity for the minds."""
+        directives = "\n".join(f"  {i+1}. {d}" for i, d in enumerate(self.PRIME_DIRECTIVES))
+        goals = "\n".join(
+            f"  - {g.name} [{g.priority.name}]: {g.description} (urgency: {g.urgency:.2f})"
+            for g in self.goals if g.active
+        )
+        opinions = self.opinion_system.get_all_opinions()
+        opinion_lines = "\n".join(
+            f"  - {o.topic}: {o.position} (confidence: {o.confidence:.2f})"
+            for o in opinions[:5]
+        ) if opinions else "  (none yet)"
+
+        mood_str = (
+            "thriving" if self.mood > 0.7
+            else "stable" if self.mood > 0.4
+            else "distressed"
+        )
+
+        return (
+            f"You are Heka, an autonomous self-evolving agent.\n"
+            f"Cycle: {self.cycle_count} | Mood: {mood_str} ({self.mood:.2f})\n\n"
+            f"Prime Directives:\n{directives}\n\n"
+            f"Active Goals:\n{goals}\n\n"
+            f"Current Opinions:\n{opinion_lines}"
+        )
+
+    def tick(self):
+        """Called at the end of each cycle to decay desires and drift mood."""
+        for goal in self.goals:
+            for desire in goal.desires:
+                desire.decay()
+        # Mood drifts toward neutral over time
+        self.mood += (0.5 - self.mood) * 0.05
+
+    def serialize(self) -> dict:
+        """Serialize soul state for persistence."""
+        return {
+            "birth_time": self.birth_time,
+            "cycle_count": self.cycle_count,
+            "mood": self.mood,
+            "goals": [
+                {
+                    "name": g.name,
+                    "priority": g.priority.value,
+                    "active": g.active,
+                    "desires": [
+                        {
+                            "name": d.name,
+                            "intensity": d.intensity,
+                            "satisfied": d.satisfied,
+                            "last_pursued": d.last_pursued,
+                        }
+                        for d in g.desires
+                    ],
+                }
+                for g in self.goals
+            ],
+            "opinions": [
+                {
+                    "topic": o.topic,
+                    "position": o.position,
+                    "confidence": o.confidence,
+                    "times_defended": o.times_defended,
+                }
+                for o in self.opinion_system.get_all_opinions()
+            ],
+        }
+
+    def restore(self, data: dict):
+        """Restore soul state from serialized data."""
+        self.birth_time = data.get("birth_time", self.birth_time)
+        self.cycle_count = data.get("cycle_count", self.cycle_count)
+        self.mood = data.get("mood", self.mood)
+
+        # Restore desire intensities
+        goal_data = data.get("goals", [])
+        goal_map = {g["name"]: g for g in goal_data}
+        for goal in self.goals:
+            if goal.name in goal_map:
+                gd = goal_map[goal.name]
+                goal.active = gd.get("active", True)
+                desire_map = {d["name"]: d for d in gd.get("desires", [])}
+                for desire in goal.desires:
+                    if desire.name in desire_map:
+                        dd = desire_map[desire.name]
+                        desire.intensity = dd.get("intensity", desire.intensity)
+                        desire.satisfied = dd.get("satisfied", False)
+                        desire.last_pursued = dd.get("last_pursued")
+
+        # Restore opinions
+        for op_data in data.get("opinions", []):
+            topic = op_data.get("topic")
+            position = op_data.get("position")
+            if topic and position and topic not in self.opinion_system.opinions:
+                opinion = Opinion(
+                    topic=topic,
+                    position=position,
+                    confidence=op_data.get("confidence", 0.0),
+                    times_defended=op_data.get("times_defended", 0),
+                )
+                self.opinion_system.opinions[topic] = opinion
